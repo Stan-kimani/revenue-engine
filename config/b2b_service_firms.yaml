@@ -1,0 +1,228 @@
+# config/industries/b2b-service-firms.yaml
+# First industry pack. Governs enrichment vocabulary, scoring, voice, sequences and
+# commercial boundaries for one vertical. Validated at boot against
+# schemas/entities/industry_pack.json — the system refuses to start on an invalid pack.
+#
+# Pinned per-lead as leads.industry_pack. Changing weights here does NOT alter
+# historical scores (entity model §3.4).
+
+name: b2b-service-firms
+version: 1
+status: draft            # draft | active — draft packs cannot launch campaigns
+base_currency_note: revenue figures below are USD (config/base.yaml finance.base_currency)
+
+# ---------------------------------------------------------------------------
+# ICP — what the deterministic scorer can actually check
+# ---------------------------------------------------------------------------
+icp:
+  summary: >
+    Client-service businesses that bill for people's time and lose margin to manual
+    admin, follow-up and reporting. Big enough to feel the cost, small enough that one
+    person can approve a build.
+
+  firmographics:
+    business_models: [b2b_services, agency, consulting, recruiting_staffing, accounting]
+    employee_bands: ["11-50", "51-200"]        # primary
+    employee_bands_secondary: ["1-10"]          # scored lower, not excluded
+    revenue_signals: [growing, established]
+    geographies_preferred: [US, UK, CA, AU, AE, SG, KE, ZA, IN, PL, DE, FR, NL, SE, CH, IE]
+
+  roles:
+    target_titles:
+      - founder
+      - owner
+      - managing director
+      - operations director
+      - head of operations
+      - coo
+      - practice manager
+      - agency director
+    seniority_weight:
+      founder_owner: 1.0
+      c_level: 0.9
+      director: 0.75
+      manager: 0.45
+      ic: 0.1
+
+  # Machine-checkable only. Human-judgment disqualifiers live in
+  # qualification.discovery_checklist below — do NOT put them here, the scorer
+  # cannot see them and pretending otherwise makes scores dishonest.
+  disqualifiers:
+    - id: too_small
+      rule: employee_band == "1-10" AND revenue_signal in [pre_revenue, early]
+      reason: "Needs business fundamentals more than automation. No budget for a build."
+    - id: bespoke_creative
+      rule: business_model == "creative_studio" OR positioning matches bespoke_project_work
+      reason: "Every job differs; automation savings cannot be evidenced."
+    - id: competitor
+      rule: business_model in [automation_agency, ai_consultancy, rpa_vendor]
+      reason: "They sell what we sell."
+    - id: enterprise
+      rule: employee_band in ["201-1000", "1000+"]
+      reason: "Procurement cycle exceeds what a two-person team can carry. Revisit later."
+    - id: regulated_health
+      rule: industry matches [clinic, hospital, medical_practice, healthcare_provider]
+      reason: >
+        Patient data requires a compliance posture (BAA, PHI handling, residency) we do
+        not yet have. Deliberate exclusion, not an oversight. Revisit when it exists.
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+scoring:
+  weights:
+    icp_match: 0.35          # deterministic: firmographics + role
+    intent: 0.25             # LLM sub-score: buying_intent
+    engagement: 0.20         # deterministic: replies, clicks, meetings
+    size_fit: 0.20           # deterministic: employee band vs primary/secondary
+  bands:
+    sql: 78
+    mql: 58
+    warm: 38
+    # below warm = cold
+  min_confidence_to_store: 0.4    # attributes below this are discarded, not stored
+
+  # Passed to qualification/score_lead.md as {{scoring_guidance}}
+  guidance: |
+    Buying intent in this vertical shows up as: hiring for an ops or admin role,
+    publicly complaining about capacity, recent headcount growth without systems,
+    job posts mentioning manual reporting, or an inbound enquiry.
+    It does NOT show up as: a nice website, being in the right industry, or having
+    a plausible-sounding problem. Absence of a signal is 0.0-0.2.
+
+    Seniority fit is high when one person can approve a five-figure build. In a
+    30-person agency the founder or ops director can. In a 150-person firm they
+    usually cannot without a committee — score lower.
+
+# ---------------------------------------------------------------------------
+# Discovery qualification — human judgment, NOT scored
+# ---------------------------------------------------------------------------
+# These disqualifiers cannot be detected from enrichment data. They are checked by a
+# human on the discovery call. Failing any of them ends the pursuit regardless of score.
+qualification:
+  discovery_checklist:
+    - id: named_process_owner
+      question: "Who owns this process today, by name?"
+      fail_if: "No single owner, or the answer is a committee."
+      reason: "AI builds fail when nobody owns the process or the inputs."
+    - id: can_describe_workflow
+      question: "Walk me through the current workflow, step by step."
+      fail_if: "They cannot describe it, or they describe a desired outcome instead."
+      reason: "Wanting 'an AI thing' without a workflow means there is nothing to build."
+    - id: measurable_outcome
+      question: "If this works, what number changes?"
+      fail_if: "No number, or the only answer is 'save time'."
+      reason: "Unmeasurable value cannot be defended at renewal."
+    - id: data_exists_somewhere
+      question: "Where does the data live now?"
+      fail_if: "Scattered across individuals' inboxes and spreadsheets with no system of record."
+      reason: "Data cleanup becomes the project and blows scope."
+    - id: process_change_appetite
+      question: "Are you open to changing how the team works, or do you want a tool bolted on?"
+      fail_if: "Tool-only. Expects software to fix a process problem."
+      reason: "Sustainable value comes from process redesign, not just software."
+
+# ---------------------------------------------------------------------------
+# Voice — passed to all drafting prompts as {{voice_rules}} / {{sender_persona}}
+# ---------------------------------------------------------------------------
+voice:
+  sender_persona: >
+    A practitioner who builds these systems personally, writing to another operator.
+    Specific, unhurried, faintly understated. Not a vendor, not a growth marketer.
+
+  tone_rules:
+    - Lead with the operational reality, not with capability claims.
+    - Frame value as capacity and revenue, never as "saving time" or headcount cost.
+    - Concrete over abstract: name the workflow, not "your processes".
+    - Never claim to know their numbers. Ask.
+    - Short sentences. No throat-clearing before the point.
+
+  vocabulary:
+    say:
+      - capacity
+      - follow-up
+      - intake
+      - handoff
+      - response time
+      - without hiring
+      - system of record
+    avoid:
+      - AI transformation
+      - digital transformation
+      - revolutionise / game-changing / cutting-edge
+      - leverage (as a verb)
+      - solutions (as a noun for what we sell)
+      - synergy
+      - unlock / supercharge / 10x
+      - "in today's fast-paced world"
+
+# ---------------------------------------------------------------------------
+# Commercial boundaries — passed to handle_objection and draft_proposal
+# ---------------------------------------------------------------------------
+commercial_boundaries:
+  never_state_autonomously:
+    - any price, rate, or range
+    - any discount or percentage
+    - contract terms, payment terms, or guarantees
+    - delivery dates not present in the service catalogue
+  on_pricing_question: "Acknowledge, offer a short call, set requires_human: true."
+  escalate_immediately_on: [legal, procurement, compliance, anger, enterprise_process]
+
+# ---------------------------------------------------------------------------
+# Objection vocabulary — closed set. classify_reply and objection.category use ONLY these.
+# ---------------------------------------------------------------------------
+objections:
+  categories:
+    price:      "Cost, budget, or perceived expense."
+    timing:     "Not now, busy season, next quarter, mid-migration."
+    trust:      "Unproven, no case studies in our industry, who are you."
+    need:       "We already handle this, or we don't see the problem."
+    authority:  "Need to check with a partner, board, or client."
+    competitor: "Already working with someone, or evaluating alternatives."
+    other:      "Genuinely fits none of the above. Explain in reasoning."
+
+# ---------------------------------------------------------------------------
+# Sequences
+# ---------------------------------------------------------------------------
+sequences:
+  default:
+    key: service_firms_v1
+    steps:
+      - day: 0
+        prompt: sales/draft_initial_outreach
+        intent: "One specific observation about their operation, one easy question."
+      - day: 4
+        prompt: sales/draft_followup
+        intent: "New angle: a concrete example of the same workflow fixed elsewhere."
+      - day: 11
+        prompt: sales/draft_followup
+        intent: "Lower the ask. Offer something useful with no meeting attached."
+      - day: 21
+        prompt: sales/draft_followup
+        intent: "Clean close. Easy to say no, easy to return later. No ultimatum."
+  reply_confidence_min: 0.75
+
+# ---------------------------------------------------------------------------
+# Service catalogue — passed to draft_proposal. Outcomes, never activities.
+# ---------------------------------------------------------------------------
+service_catalogue:
+  entry:
+    name: Operations diagnostic
+    outcome: "A ranked map of where work leaks, with one build scoped and costed."
+    duration: "1-2 weeks"
+  core:
+    name: Fixed-scope build sprint
+    outcome: "One workflow automated end to end, with a measurable before/after number."
+    duration: "3-6 weeks"
+  ongoing:
+    name: Automation retainer
+    outcome: "We own the automation layer; new workflows added as they surface."
+    duration: "rolling monthly"
+  pricing: HUMAN_SET_ONLY     # the model never sets or infers a price
+
+channels:
+  email: true
+  linkedin: false             # drafted for manual posting only; no automation (ToS)
+
+account_limits:
+  single_thread_per_company: true    # entity model R1 — enforced by DB constraint
