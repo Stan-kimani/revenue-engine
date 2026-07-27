@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "outreach_draft",
+  "description": "Shared by draft_initial_outreach and draft_followup. facts_asserted is cross-validated in code: every anchor_id must exist in the prospect profile, or the draft is rejected before it can be queued for approval.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "subject",
+    "body",
+    "word_count",
+    "cta",
+    "facts_asserted",
+    "tone_check"
+  ],
+  "properties": {
+    "subject": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 78,
+      "description": "Lowercase or sentence case. No colons-as-headline, no clickbait."
+    },
+    "body": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 1200
+    },
+    "word_count": {
+      "type": "integer",
+      "minimum": 20,
+      "maximum": 220,
+      "description": "Must match the actual body word count; validated in code."
+    },
+    "cta": {
+      "type": "object",
+      "required": [
+        "kind",
+        "text"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "question",
+            "meeting_ask",
+            "soft_interest",
+            "resource_offer"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 200
+        }
+      }
+    },
+    "facts_asserted": {
+      "type": "array",
+      "maxItems": 4,
+      "description": "Every claim the email makes about the prospect, each tied to an anchor. An empty array means the email asserts nothing specific about them.",
+      "items": {
+        "type": "object",
+        "required": [
+          "claim",
+          "anchor_id"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "claim": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "anchor_id": {
+            "type": "string",
+            "pattern": "^anchor_[0-9]{1,2}$"
+          }
+        }
+      }
+    },
+    "tone_check": {
+      "type": "object",
+      "required": [
+        "matches_voice_rules",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "matches_voice_rules": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 300
+        }
+      }
+    }
+  }
+}

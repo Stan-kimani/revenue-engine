@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "proposal_draft",
+  "description": "Always approval-gated (A2). pricing_present is used by the gate; a proposal that mentions numbers can never send autonomously.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "title",
+    "problem_statement",
+    "proposed_scope",
+    "out_of_scope",
+    "assumptions",
+    "timeline",
+    "pricing_present",
+    "pricing_placeholders",
+    "confidence"
+  ],
+  "properties": {
+    "title": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "problem_statement": {
+      "type": "string",
+      "maxLength": 900,
+      "description": "In the prospect's own framing, drawn from conversation history."
+    },
+    "proposed_scope": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": [
+          "item",
+          "outcome"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "item": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "outcome": {
+            "type": "string",
+            "maxLength": 240,
+            "description": "The measurable result, not the activity."
+          }
+        }
+      }
+    },
+    "out_of_scope": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "maxLength": 240
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": [
+          "phase",
+          "duration"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "phase": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "duration": {
+            "type": "string",
+            "maxLength": 60
+          }
+        }
+      }
+    },
+    "pricing_present": {
+      "type": "boolean",
+      "description": "true if any monetary figure appears anywhere in this draft."
+    },
+    "pricing_placeholders": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "string",
+        "maxLength": 120
+      },
+      "description": "Where a human must insert commercial terms. The model never sets a price."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  }
+}

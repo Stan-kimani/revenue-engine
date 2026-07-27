@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "account_brief",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "angle",
+    "supporting_anchors",
+    "proof_to_reference",
+    "avoid",
+    "confidence"
+  ],
+  "properties": {
+    "angle": {
+      "type": "string",
+      "maxLength": 400,
+      "description": "The single most credible reason to reach out now."
+    },
+    "supporting_anchors": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "string",
+        "pattern": "^anchor_[0-9]{1,2}$"
+      },
+      "description": "anchor_ids from the prospect profile that justify the angle."
+    },
+    "proof_to_reference": {
+      "type": "array",
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "required": [
+          "claim",
+          "source_ref"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "claim": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "source_ref": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "Retrieved memory id or case reference. Never invented."
+          }
+        }
+      }
+    },
+    "avoid": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "description": "Topics, phrasings or assumptions that would misfire with this account."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  }
+}
