@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import uuid
 
 import asyncpg
@@ -209,6 +210,116 @@ async def test_second_active_lead_same_company_returns_deferral_not_exception(
     assert second.deferred is True
     assert second.lead.status == LeadStatus.DEFERRED
     assert second.blocked_by_lead_id == first.lead.id
+
+
+@pytest.mark.protected
+async def test_both_single_thread_indexes_have_identical_exclusion_list(
+    conn: asyncpg.Connection,
+):
+    """Reads the live catalog (pg_indexes), not the migration file — the
+    catalog is what actually governs collisions, and it's exactly what a
+    future migration could let drift apart without anyone noticing. If the
+    two lists ever diverge, the deferred-placeholder insert in create_lead()
+    can start colliding with one of these indexes again.
+    """
+    rows = await conn.fetch(
+        "SELECT indexname, indexdef FROM pg_indexes "
+        "WHERE tablename = 'leads' "
+        "AND indexname IN ('one_active_lead_per_contact', 'one_active_lead_per_company')"
+    )
+    assert len(rows) == 2
+
+    exclusion_pattern = re.compile(r"status <> ALL \(ARRAY\[(.*?)\]\)")
+    value_pattern = re.compile(r"'([a-z_]+)'::text")
+
+    exclusions: dict[str, set[str]] = {}
+    for row in rows:
+        match = exclusion_pattern.search(row["indexdef"])
+        assert match is not None, f"no exclusion list found in {row['indexdef']!r}"
+        exclusions[row["indexname"]] = set(value_pattern.findall(match.group(1)))
+
+    contact_exclusions = exclusions["one_active_lead_per_contact"]
+    company_exclusions = exclusions["one_active_lead_per_company"]
+
+    assert contact_exclusions == company_exclusions
+    assert "deferred" in contact_exclusions
+    assert contact_exclusions == {
+        "deferred",
+        "converted",
+        "disqualified",
+        "unsubscribed",
+        "dormant",
+    }
+
+
+class _ForcedFailureTransaction:
+    async def __aenter__(self) -> None:
+        raise asyncpg.exceptions.UniqueViolationError("simulated: fault-injection test")
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
+
+
+class _FaultInjectingConnection:
+    """Duck-typed proxy over a real asyncpg.Connection, forcing `.transaction()`
+    to fail. asyncpg.Connection is a C-extension object and does not allow
+    monkeypatching instance attributes directly (`'Connection' object
+    attribute 'transaction' is read-only`), so a wrapper is the only way to
+    inject this fault — repositories.create_lead() only ever calls
+    `fetchrow` and `transaction` on the connection it's given.
+    """
+
+    def __init__(self, real: asyncpg.Connection) -> None:
+        self._real = real
+
+    async def fetchrow(self, *args: object, **kwargs: object) -> asyncpg.Record | None:
+        return await self._real.fetchrow(*args, **kwargs)  # type: ignore[arg-type]
+
+    def transaction(self, *args: object, **kwargs: object) -> _ForcedFailureTransaction:
+        return _ForcedFailureTransaction()
+
+
+@pytest.mark.protected
+async def test_deferred_insert_failure_returns_typed_result_not_raise(
+    conn: asyncpg.Connection,
+):
+    """The deferred-placeholder insert cannot fail via either single-thread
+    index with real data today: status='deferred' is excluded from both
+    indexes' predicates (confirmed live by the test above), so it cannot
+    violate either one, and every other column reuses values that already
+    passed on the first insert attempt — there is no real way to construct a
+    failing "double collision" against the current schema. That's a property
+    of the current schema, not a guarantee create_lead() should trust blindly
+    forever (see docs/decisions.md). This proves the defensive path itself
+    works — that create_lead() is total and never raises a raw database
+    exception from that step — via fault injection, since it can't be
+    reached with genuine data.
+    """
+    company = await repo.upsert_company(conn, name="Acme", domain="acme.com")
+    contact_a = await repo.upsert_contact(conn, email="a@acme.com", company_id=company.id)
+    contact_b = await repo.upsert_contact(conn, email="b@acme.com", company_id=company.id)
+
+    await repo.create_lead(
+        conn,
+        contact_id=contact_a.id,
+        company_id=company.id,
+        industry_pack="b2b-service-firms",
+        source=LeadSource.DISCOVERY,
+    )
+
+    faulty_conn = _FaultInjectingConnection(conn)
+    result = await repo.create_lead(
+        faulty_conn,  # type: ignore[arg-type]
+        contact_id=contact_b.id,
+        company_id=company.id,
+        industry_pack="b2b-service-firms",
+        source=LeadSource.DISCOVERY,
+    )
+
+    assert result.failed is True
+    assert result.lead is None
+    assert result.deferred is False
+    assert result.error is not None
 
 
 @pytest.mark.protected

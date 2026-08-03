@@ -151,15 +151,29 @@ class Lead(BaseModel):
 
 
 class LeadCreationResult(BaseModel):
-    """Return type of repositories.create_lead().
+    """Return type of repositories.create_lead(). Total over three outcomes —
+    no path raises a raw database exception:
 
-    The single-thread rule (one_active_lead_per_company) blocking a create is
-    a normal business outcome (event-catalog.md §3), not an error — it never
-    raises. `lead` is always a real, persisted row either way: the newly
-    created active lead when `deferred` is False, or the `status='deferred'`
-    placeholder row event-catalog.md §3 documents when it's True. The caller
-    (a later milestone — core/events.py doesn't exist yet) emits
-    `lead.deferred` when `deferred` is True.
+    1. Created (`deferred=False, failed=False`): `lead` is the newly created
+       active lead.
+    2. Deferred (`deferred=True, failed=False`): the single-thread rule
+       (one_active_lead_per_company) blocked the create — a normal business
+       outcome (event-catalog.md §3), not an error. `lead` is the persisted
+       `status='deferred'` placeholder row event-catalog.md §3 documents. The
+       caller (a later milestone — core/events.py doesn't exist yet) emits
+       `lead.deferred`.
+    3. Failed (`failed=True`): the deferred-placeholder insert itself could
+       not be completed (any database error, not just a unique violation).
+       `lead` is None; `error` carries the failure for the caller to log or
+       decide what to do with. `blocked_by_lead_id` is still populated if it
+       was found before the failure. Mechanically, this should be
+       unreachable today — a `status='deferred'` row is excluded from both
+       partial indexes' predicates, so it cannot violate either — but the
+       contract is enforced unconditionally rather than assumed, since it
+       depends on both indexes' exclusion lists staying identical forever
+       (docs/decisions.md has the full reasoning and a test that forces this
+       branch via fault injection, since it can't be reached with real data
+       under the current schema).
 
     The contact-level constraint (one_active_lead_per_contact) is a different
     case and is NOT represented here — create_lead() raises
@@ -167,9 +181,11 @@ class LeadCreationResult(BaseModel):
     business-outcome event for it.
     """
 
-    lead: Lead
+    lead: Lead | None
     deferred: bool
+    failed: bool = False
     blocked_by_lead_id: UUID | None = None
+    error: str | None = None
 
 
 class Event(BaseModel):

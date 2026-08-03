@@ -509,3 +509,112 @@ via `\d embeddings`, `deals.closed_deal_requires_frozen_fx` and
 `\d`. All 53 tests (`tests/unit` + `tests/contracts` + `tests/integration`)
 pass, including all 8 protected tests. `ruff check`, `ruff format --check`,
 and `mypy --strict` on `core/` and `db/` are clean.
+
+## 2026-08-04 — M0.2: create_lead() made total over the deferred-insert step
+
+**Iteration/triage log.** Before writing any code, worked through the
+mechanism the instruction asked to confirm agreement on, then verified it
+empirically against a real Postgres instance rather than trusting the
+reasoning alone:
+
+1. Re-read `migrations/0001_init.sql`'s two partial index definitions
+   directly (not from memory). Both `one_active_lead_per_contact` and
+   `one_active_lead_per_company` carry the identical exclusion list:
+   `NOT IN ('deferred', 'converted', 'disqualified', 'unsubscribed',
+   'dormant')`.
+2. **Mechanism, stated exactly:** a partial unique index only constrains rows
+   that satisfy its `WHERE` predicate. A row with `status='deferred'` fails
+   `status NOT IN (...)` for *both* indexes (since `'deferred'` is in both
+   lists) — it therefore satisfies *neither* predicate, and is invisible to
+   both indexes' uniqueness check entirely, regardless of its `contact_id` or
+   `company_id`, and regardless of what other rows already exist for that
+   contact or company. Nothing collides with a `status='deferred'` insert on
+   these two indexes — not by luck, but because the exclusion makes the row
+   unconditionally exempt from both. This is what "both indexes carry the
+   identical five-value exclusion list" is actually for: symmetry is what
+   makes the deferred row exempt from *both* sides of the single-thread rule
+   at once.
+3. Confirmed the live catalog matches this reasoning: `pg_indexes.indexdef`
+   for both indexes renders the `NOT IN` as `<> ALL (ARRAY['deferred'::text,
+   'converted'::text, 'disqualified'::text, 'unsubscribed'::text,
+   'dormant'::text])` — byte-identical arrays.
+4. **Tried to empirically construct the "double collision" scenario as
+   originally imagined:** contact A already has an active lead (at company
+   Z), contact A now attempts company Y, which is already occupied by
+   contact B's active lead — i.e. *both* single-thread rules would be
+   violated by contact A's second attempt. Result:
+   `create_lead()` raised `DuplicateActiveLeadError` for
+   `one_active_lead_per_contact` — correctly, per the "contact already has an
+   active lead → raise" rule — and never reached the deferred-insert branch
+   at all, because Postgres reported the contact-level violation on the
+   *first* insert attempt before company-level was ever relevant.
+5. Reasoned through whether a different constraint-evaluation order could
+   route this into the deferred-insert branch instead (Postgres's order of
+   checking multiple violated unique indexes on one row isn't a documented,
+   stable guarantee). Even in that case, step 2's exemption still holds: the
+   deferred insert reuses `contact_id`, `company_id`, and every other column
+   from the original (already-valid) attempt, changing only `status` to
+   `'deferred'` — which is exempt from both indexes regardless of which one
+   Postgres happened to report first. No FK, CHECK, or PK constraint on
+   `leads` can fire either, since every other value already passed on the
+   first attempt.
+
+**Conclusion:** the specific "deferred insert collides with a real second
+active lead" scenario is not reachable through real data under the current
+schema — provably, by construction, not by luck of the current index
+creation order. The original docstring calling this "a rare double
+collision" was wrong; it described a scenario the schema already rules out.
+
+**This does not mean the requested fix is unnecessary.** The exemption in
+step 2 is a property of the current schema — it holds *only* as long as both
+indexes' exclusion lists stay identical. Nothing enforces that they will:
+a future migration could add a status value, touch one index and not the
+other, or add an entirely new unique constraint to `leads` that doesn't know
+about `'deferred'` at all. `create_lead()` should not depend on a human
+correctly re-deriving this proof every time `migrations/*.sql` changes.
+Implemented exactly as asked:
+
+- `LeadCreationResult` gains `failed: bool` and `error: str | None`, and
+  `lead` becomes `Lead | None` (None only when `failed=True`).
+- The deferred-placeholder insert is now wrapped in its own
+  `try/except asyncpg.PostgresError`, returning
+  `LeadCreationResult(failed=True, error=str(exc), blocked_by_lead_id=...)`
+  instead of propagating. No path out of `create_lead()` can now raise a raw
+  `UniqueViolationError` (or any other bare `PostgresError`) — the three
+  outcomes (created / deferred / failed) are exhaustive, and the contract is
+  documented on `LeadCreationResult` itself.
+- The contact-level path is unchanged: still raises `DuplicateActiveLeadError`
+  immediately, matching the protected test's contract.
+
+**Testing a path that can't be reached with real data.** Since step 4 showed
+the failure branch is empirically unreachable with genuine conflicting data,
+`test_deferred_insert_failure_returns_typed_result_not_raise` uses fault
+injection instead: a thin duck-typed proxy (`_FaultInjectingConnection`)
+wraps the real connection and forces `.transaction()` to raise, while
+`fetchrow` still passes through to real Postgres for the setup. (First
+attempt used `monkeypatch.setattr(conn, "transaction", ...)` directly on the
+`asyncpg.Connection` instance — failed immediately with `AttributeError:
+'Connection' object attribute 'transaction' is read-only`, since asyncpg's
+`Connection` is a compiled C-extension type that doesn't allow arbitrary
+instance-attribute assignment. Switched to a wrapper object instead of
+fighting the C extension.) This tests that `create_lead()`'s failure path
+itself is correct, not that the scenario occurs naturally — both things are
+now true and both are documented as such, in the test's docstring and here.
+
+**New tests, both `@pytest.mark.protected` (10 total now, confirmed via
+`pytest -m protected --collect-only`):**
+`test_both_single_thread_indexes_have_identical_exclusion_list` (reads
+`pg_indexes.indexdef` live, regex-extracts each index's exclusion array, and
+asserts the two sets are equal — not asserted against the migration file
+text, which is exactly what could drift silently) and
+`test_deferred_insert_failure_returns_typed_result_not_raise` (fault
+injection, described above).
+
+**Verification:** all 55 tests (`tests/unit` + `tests/contracts` +
+`tests/integration`) pass against a real, disposable Postgres instance,
+including both new protected tests and the empirical double-collision probe
+from step 4 above (run as an ad-hoc script, not committed as a test, since it
+demonstrates a *correct raise*, not a business rule — the actual protected
+regression coverage for "contact already active → raise" already exists).
+`ruff check`, `ruff format --check`, and `mypy --strict` on `core/` and
+`db/` are clean.

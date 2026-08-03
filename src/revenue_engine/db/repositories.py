@@ -265,7 +265,8 @@ async def create_lead(
     budget_band: BudgetBand | None = None,
     budget_source: BudgetSource | None = None,
 ) -> LeadCreationResult:
-    """Create a new lead ("pursuit").
+    """Create a new lead ("pursuit"). Total over three outcomes — see
+    LeadCreationResult's docstring — never raises a raw database exception.
 
     The two single-thread constraints are handled differently, deliberately:
 
@@ -279,9 +280,16 @@ async def create_lead(
       documented business outcome — it raises `DuplicateActiveLeadError`, not
       a raw `UniqueViolationError`.
 
-    If the deferred-placeholder insert itself fails (e.g. this contact also
-    already has another active lead elsewhere — a rare double-collision), that
-    exception is not caught here and propagates as-is.
+    The deferred-placeholder insert is wrapped separately: both single-thread
+    indexes exclude `status='deferred'` from their predicate (identically —
+    see docs/decisions.md), so that insert cannot violate either one, and
+    mechanically no other constraint on `leads` can fire either, since every
+    other column reuses values that already passed on the first attempt. It
+    is nonetheless not trusted to always succeed — any database error there
+    returns `LeadCreationResult(failed=True, error=...)` instead of
+    propagating, so a future migration that (for example) lets the two
+    indexes' exclusion lists drift apart can't turn into an unhandled
+    exception here.
     """
     try:
         row = await conn.fetchrow(
@@ -306,36 +314,47 @@ async def create_lead(
         if exc.constraint_name != "one_active_lead_per_company":
             raise DuplicateActiveLeadError(exc.constraint_name or "unknown") from exc
 
-        async with conn.transaction():
-            blocking = await conn.fetchrow(
-                """
-                SELECT id FROM leads
-                WHERE company_id = $1
-                  AND status NOT IN
-                      ('deferred', 'converted', 'disqualified', 'unsubscribed', 'dormant')
-                  AND deleted_at IS NULL
-                LIMIT 1
-                """,
-                company_id,
+        blocking = None
+        try:
+            async with conn.transaction():
+                blocking = await conn.fetchrow(
+                    """
+                    SELECT id FROM leads
+                    WHERE company_id = $1
+                      AND status NOT IN
+                          ('deferred', 'converted', 'disqualified', 'unsubscribed', 'dormant')
+                      AND deleted_at IS NULL
+                    LIMIT 1
+                    """,
+                    company_id,
+                )
+                deferred_row = await conn.fetchrow(
+                    f"""
+                    INSERT INTO leads ({_LEAD_INSERT_COLUMNS})
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    RETURNING *
+                    """,
+                    contact_id,
+                    company_id,
+                    campaign_id,
+                    industry_pack,
+                    source.value,
+                    LeadStatus.DEFERRED.value,
+                    problem_statement,
+                    pain_category.value if pain_category else None,
+                    team_size_band.value if team_size_band else None,
+                    budget_band.value if budget_band else None,
+                    budget_source.value if budget_source else None,
+                )
+        except asyncpg.PostgresError as inner_exc:
+            return LeadCreationResult(
+                lead=None,
+                deferred=False,
+                failed=True,
+                blocked_by_lead_id=blocking["id"] if blocking else None,
+                error=str(inner_exc),
             )
-            deferred_row = await conn.fetchrow(
-                f"""
-                INSERT INTO leads ({_LEAD_INSERT_COLUMNS})
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING *
-                """,
-                contact_id,
-                company_id,
-                campaign_id,
-                industry_pack,
-                source.value,
-                LeadStatus.DEFERRED.value,
-                problem_statement,
-                pain_category.value if pain_category else None,
-                team_size_band.value if team_size_band else None,
-                budget_band.value if budget_band else None,
-                budget_source.value if budget_source else None,
-            )
+
         assert deferred_row is not None
         return LeadCreationResult(
             lead=_row_to_lead(deferred_row),
