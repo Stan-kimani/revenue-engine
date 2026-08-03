@@ -186,3 +186,15 @@ explicitly exempts — rather than the domain SQL rule 4 targets, since
 `db/repositories.py` does not exist until M0.2 and the migration runner has to be
 connectable and testable before then. Revisit explicitly at M0.2 once
 `repositories.py` exists, rather than assumed settled by this note.
+
+**Resolved 2026-08-03.** Confirmed as proposed: `scripts/migrate.py`'s SQL is
+schema tooling, not application data access, and stays where it is. CLAUDE.md
+rule 4 amended to say so explicitly — it now reads "All *application* SQL lives
+in `db/repositories.py`. No inline SQL in agents, routes, or orchestrator code.
+Exempt: migration files (`migrations/*.sql`) and the migration runner
+(`scripts/migrate.py`), which are schema tooling, not data access. Nothing else
+is exempt." `scripts/` was dropped from the no-inline-SQL list and replaced with
+a named, bounded exemption — not a blanket carve-out for all scripts. Any other
+script (`seed_dev.py`, `run_worker.py`, `backfill_embeddings.py`, etc.) still
+must not contain inline SQL once `db/repositories.py` exists at M0.2; only the
+migration runner and the migration files themselves are schema tooling.

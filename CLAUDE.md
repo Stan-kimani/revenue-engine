@@ -31,8 +31,10 @@ Violating any of these is a bug, even if the code works.
    Anthropic/OpenAI SDK directly from an agent, route, or script.
 3. **No prompt text in Python files.** Prompts live in `prompts/**.md` only.
    No f-string prompt assembly, no inline system messages, no exceptions.
-4. **All SQL lives in `src/revenue_engine/db/repositories.py`.** No inline SQL in
-   agents, routes, scripts, or orchestrator code.
+4. **All application SQL lives in `src/revenue_engine/db/repositories.py`.**
+   No inline SQL in agents, routes, or orchestrator code. Exempt: migration
+   files (`migrations/*.sql`) and the migration runner (`scripts/migrate.py`),
+   which are schema tooling, not data access. Nothing else is exempt.
 5. **Agents never import other agents.** Agents communicate only by emitting
    events. `agents/` may import `core/`, `db/`, and `integrations/` interfaces.
 6. **Every LLM output is validated against a JSON Schema in `schemas/outputs/`.**
