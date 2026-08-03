@@ -1,8 +1,19 @@
 # CLAUDE.md — Operating Rules for This Repository
 
-You are implementing the AI Revenue Engine. `revenue-engine-build-spec.md` in this
-directory is the architectural source of truth. This file is the behavioural
-contract for working in this repo. Both are binding. Where they conflict, stop and ask.
+You are implementing the AI Revenue Engine. This file is the behavioural contract for
+working in this repo. The architectural source of truth is the design set in `docs/`:
+
+| Document | Covers |
+|---|---|
+| `docs/revenue-engine-build-spec.md` | Phases, milestones, repo layout, integrations |
+| `docs/entity-model.md` | Domain entities, provenance, multi-currency |
+| `docs/event-catalog.md` | Every event, payload, emitter and consumer |
+| `docs/agent-contracts.md` | Per-agent triggers, LLM tasks, autonomy, gates |
+| `docs/phase1-llm-boundary.md` | Prompt/schema pairs and cross-field validations |
+| `docs/discovery-addendum.md` | Prospect discovery design |
+
+All are binding. Where any two conflict, stop and ask — do not pick one silently.
+Later documents supersede earlier ones; the build spec is the oldest.
 
 ---
 
@@ -30,6 +41,13 @@ Violating any of these is a bug, even if the code works.
 9. **No industry, vertical, ICP, or brand voice is hardcoded.** These come from
    `config/industries/*.yaml` via `core/config.py`. Core code stays vertical-agnostic.
 10. **No MCP servers in runtime code or `pyproject.toml`.** MCP is dev-time only.
+11. **This file overrides any installed skill.** Where a skill's guidance conflicts
+    with these rules — especially 3, 4, 6 and 7 — these rules win. Structural
+    separation is not over-engineering, and "fewer lines" never justifies inlining
+    SQL, prompts, or schema validation.
+12. **Money is `numeric`, never float.** No arithmetic across currencies without
+    converting through `base_currency`. A closed deal's `fx_rate_to_base` is
+    immutable — enforce it in `close_deal()`, not by convention.
 
 ---
 
@@ -79,6 +97,9 @@ Violating any of these is a bug, even if the code works.
   Use natural keys and upserts, not blind inserts.
 - Minimum abstraction. Do not add a base class, factory, or interface until there
   are two real implementations. Delete code rather than commenting it out.
+- `agents/sales.py` is deliberately one file covering outbound and conversation.
+  If it exceeds ~400 lines, split by lifecycle stage (outbound vs conversation),
+  never by task. Do not split it pre-emptively.
 
 ---
 
