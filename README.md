@@ -57,5 +57,6 @@ make check   # ruff + mypy --strict (core/, db/)
 
 ## Status
 
-Phase 0 skeleton, milestone M0.1 (repo scaffold). No migrations, agents, or
-orchestrator code exist yet — see build-spec §10 for the full milestone order.
+Phase 0 skeleton, milestone M0.2 (`migrations/0001_init.sql`, `db/models.py`,
+`db/repositories.py` for companies/contacts/leads/events/jobs). No agent or
+orchestrator code exists yet — see build-spec §10 for the full milestone order.

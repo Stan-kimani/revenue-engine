@@ -288,3 +288,117 @@ repeatedly.
 **Verification:** all three `tests/integration/test_migrate.py` tests
 (including the new `test_no_transaction_migration_applies_and_is_recorded`)
 pass against a real, disposable Postgres instance.
+
+## 2026-08-03 — M0.2: migrations/0001_init.sql, db/models.py, db/repositories.py
+
+Per build-spec §10, scoped to companies/contacts/leads/events/jobs for
+`repositories.py`, but migration 0001 creates the *entire* schema (all domain
+and infra tables) since entity-model.md §7 says infra tables "will be written
+directly into migration 0001 alongside the entities above." Two decisions were
+put to the user as genuinely blocking rather than guessed:
+
+1. **Closed-vocabulary columns are `text` + CHECK, not native Postgres ENUM
+   types.** Confirmed by the user. Adding/removing a value is then a plain
+   `ALTER TABLE ... DROP/ADD CONSTRAINT` inside a normal transaction, matching
+   how the objection vocabulary already changed once (7→8 categories,
+   2026-07-28 entry above). `db/models.py` still defines Python `StrEnum`s for
+   these columns as an application-layer convenience (mypy catches typos) —
+   an independent choice from the DB layer, not in tension with it.
+2. **`embeddings.vector` has no fixed dimension yet.** Confirmed by the user
+   (deferred, "Recommended" option). No embedding provider is named anywhere
+   in the docs — build-spec §7's Integrations table covers only the
+   completions LLM — and nothing before Phase 2/3 (`core/memory.py`, the first
+   `embed()` call) generates embeddings. A fixed dimension and its
+   ivfflat/hnsw index land in a later migration once a real provider is
+   chosen; until then the column is storage-only, no ANN index.
+
+**Further judgment calls, logged rather than escalated (none blocking or hard
+to reverse):**
+
+- **All foreign keys are added in a final `ALTER TABLE` block**, after every
+  `CREATE TABLE`, rather than inline. `leads.deal_id` and `deals.lead_id`
+  reference each other, so *some* deferral is structurally required; doing it
+  for every FK (not just the circular pair) keeps one consistent pattern
+  instead of two.
+- **`deleted_at` (soft delete, D4) applied to `companies`, `contacts`,
+  `campaigns`, `leads`, `deals`, `messages`, `meetings`, `meeting_insights`,
+  `objections`** — treating entity-model.md §1 D4 ("all domain entities") and
+  build-spec §5.1's "soft delete on entities" as the general rule, with the
+  per-table column lists in entity-model.md §3 as additive detail, not
+  exhaustive. `campaigns` gets `deleted_at` despite its own §3.3 column list
+  omitting it — read as an omission in that list, not an exclusion, given both
+  governing docs state the rule as blanket. **Excluded** from `lead_scores`,
+  `activities`, and `events` — all three are explicitly documented elsewhere
+  as append-only / never deleted, so an always-null `deleted_at` would serve
+  no purpose and contradicts the documented design.
+- **`events` uses `occurred_at`** (event-catalog.md §R3's full envelope:
+  `event_id, type, version, occurred_at, actor, correlation_id, causation_id,
+  idempotency_key, payload`), not `created_at` (build-spec §5.1's older,
+  terser mention). CLAUDE.md: "later documents supersede earlier ones; the
+  build spec is the oldest." `processed_at` (build-spec's operational
+  addition, for outbox polling) is kept — additive, not contradicted.
+- **Vocabularies for columns entity-model.md's per-table lists don't spell out
+  as exhaustive enums**, cross-referenced from elsewhere and given a CHECK:
+  `jobs.status` (pending/running/completed/failed/dead_letter — inferred from
+  `job.dead_lettered` and general queue semantics), `approvals.action_type`
+  and `.status` (event-catalog.md §7.1's expiry table and `approval.*`
+  events), `sequence_runs.status` (agent-contracts.md §3's Sales agent state
+  machine: pending→active→paused→completed|terminated), `campaign_assets.kind`
+  (event-catalog.md §6 `campaign.assets_created` payload), `learnings.scope`
+  and `.status` (event-catalog.md §5 `learning.published` payload and
+  agent-contracts.md §6). Low-risk given decision 1 above — these are all
+  trivially alterable later.
+- **`deals.stage` has no FK to `pipeline_stages.key`** — entity-model.md §3.6
+  explicitly calls this "FK-ish"; stage transitions are validated in code
+  against a config transition table, not a DB constraint. Followed literally,
+  not treated as an oversight.
+- **`pipeline_stages` is not seeded by this migration.** "Config-seeded"
+  (build-spec §5.1) is data, not schema, and CLAUDE.md §6 says seed data only
+  via `scripts/seed_dev.py` — which doesn't exist yet either. Migration 0001
+  creates the empty table only.
+- **`deals.value_base_amount` is a plain stored column, not a SQL `GENERATED`
+  column.** A `GENERATED` column always recomputes from its formula, which
+  would defeat freezing `fx_rate_to_base` at close (entity-model.md §8.2) —
+  `close_deal()`, a later milestone, must be able to write a value that then
+  stops changing.
+- **`src/revenue_engine/core/errors.py` created**, though build-spec §10's
+  M0.2 line only names `db/models.py` and `db/repositories.py`. CLAUDE.md §4
+  ("raise typed exceptions from `core/errors.py`. Never swallow exceptions
+  silently") is a standing rule `repositories.py` must follow *now* — the
+  single-thread constraint violation in `create_lead` has to become a typed
+  `DuplicateActiveLeadError`, not a raw `asyncpg.UniqueViolationError`, so the
+  file it's specified to come from has to exist. Kept to exactly the two
+  exceptions M0.2 needs, not a general error taxonomy.
+- **`schemas/entities/attribute.json` created** — entity-model.md §2 requires
+  every `attributes` JSONB write to validate against it before insert, and
+  `companies`/`contacts` (both in M0.2's repository scope) both have
+  `attributes` columns. In scope, not an addition.
+- **`tests/contracts/test_schemas_valid.py`** is a generic, reusable "every
+  file under `schemas/` is valid JSON Schema" test (build-spec §8), using
+  `jsonschema.validators.validator_for()` rather than a hardcoded draft so it
+  stays correct regardless of which `$schema` a given file declares. It also
+  now validates the `schemas/outputs/` and `schemas/events/` files that
+  predate this milestone.
+
+**Bug found by actually running this against Postgres, not just linting it:**
+`upsert_company`'s `domain IS NOT NULL` branch had 6 target columns in the
+`INSERT` but only 5 value placeholders (`$1..$5::jsonb` for `domain, name,
+linkedin_url, country, employee_band, attributes`) — a `PostgresSyntaxError`
+that `ruff` and `mypy --strict` both had no way to catch, since it's a string
+template, not Python syntax. Caught by
+`test_upsert_company_creates_then_updates_on_same_domain` (and four other
+tests that call `upsert_company` with a domain) against a real, disposable
+Postgres instance; fixed to `$1..$6::jsonb`.
+
+**Verification:** migration 0001 applied cleanly to a fresh Postgres 16 +
+pgvector instance (23 tables incl. `schema_migrations`, 28 foreign keys, all
+three extensions installed) and is idempotent on re-run via `scripts/migrate.py`.
+All 47 tests (`tests/unit`, `tests/contracts`, `tests/integration`) pass,
+including single-thread enforcement for both `one_active_lead_per_contact` and
+`one_active_lead_per_company`, the inbound `problem_statement` CHECK, citext
+case-insensitive email/domain matching, jsonb attribute merging across
+upserts, employment-history tracking on a contact's company change, event
+idempotency-key no-op re-emission, and the full job lifecycle (enqueue → claim
+via SKIP LOCKED → complete, and fail-with-retry vs. fail-to-dead-letter).
+`ruff check`, `ruff format --check`, and `mypy --strict` on `core/` and `db/`
+are all clean.
