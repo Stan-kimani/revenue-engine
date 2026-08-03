@@ -31,8 +31,15 @@ migrate = _load_migrate_module()
 
 
 @pytest.fixture
-async def clean_schema_migrations():
-    database_url = os.environ["DATABASE_URL"]
+def database_url() -> str:
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        pytest.skip("DATABASE_URL is not set (checked .env and the shell environment)")
+    return url
+
+
+@pytest.fixture
+async def clean_schema_migrations(database_url: str):
     conn = await asyncpg.connect(database_url)
     try:
         await conn.execute("DROP TABLE IF EXISTS schema_migrations")
@@ -43,14 +50,14 @@ async def clean_schema_migrations():
 
 
 async def test_empty_migrations_dir_creates_schema_migrations_table(
-    tmp_path, monkeypatch, clean_schema_migrations
+    tmp_path, monkeypatch, database_url, clean_schema_migrations
 ):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
 
     exit_code = await migrate.run()
     assert exit_code == 0
 
-    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    conn = await asyncpg.connect(database_url)
     try:
         exists = await conn.fetchval(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
@@ -64,7 +71,9 @@ async def test_empty_migrations_dir_creates_schema_migrations_table(
         await conn.close()
 
 
-async def test_running_twice_is_idempotent(tmp_path, monkeypatch, clean_schema_migrations):
+async def test_running_twice_is_idempotent(
+    tmp_path, monkeypatch, database_url, clean_schema_migrations
+):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
 
     first_exit = await migrate.run()
@@ -73,7 +82,7 @@ async def test_running_twice_is_idempotent(tmp_path, monkeypatch, clean_schema_m
     assert first_exit == 0
     assert second_exit == 0
 
-    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    conn = await asyncpg.connect(database_url)
     try:
         row_count = await conn.fetchval("SELECT count(*) FROM schema_migrations")
         assert row_count == 0

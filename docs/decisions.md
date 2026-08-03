@@ -198,3 +198,51 @@ a named, bounded exemption — not a blanket carve-out for all scripts. Any othe
 script (`seed_dev.py`, `run_worker.py`, `backfill_embeddings.py`, etc.) still
 must not contain inline SQL once `db/repositories.py` exists at M0.2; only the
 migration runner and the migration files themselves are schema tooling.
+
+## 2026-08-03 — M0.1 defect: integration test crashed instead of skipping without .env
+
+**Context:** `tests/integration/test_migrate.py` read `os.environ["DATABASE_URL"]`
+directly. `scripts/migrate.py` calls `load_dotenv()` itself, but nothing loaded
+`.env` for the *test process* before that — so a normal `uv run pytest
+tests/integration` on a machine with a `.env` file but no exported shell
+variable raised `KeyError`, not a real test failure. The prior verification of
+the migrate.py reorder only passed because `DATABASE_URL` was exported manually
+in that shell, which masked this.
+
+**Decision:** added `tests/conftest.py` calling `load_dotenv()` at import time,
+so every test process sees `.env` exactly as `scripts/migrate.py` does, with no
+per-test or per-fixture loading. `tests/integration/test_migrate.py` gained a
+`database_url` fixture that calls `pytest.skip(...)` with a clear reason if
+`DATABASE_URL` is still unset after loading — the two tests and the
+`clean_schema_migrations` fixture now depend on it instead of reading
+`os.environ` directly, so a missing database skips cleanly instead of crashing.
+
+**Verification:** confirmed both directions — with a local `.env` present
+(pointed at a disposable, isolated Postgres instance) and no exported
+`DATABASE_URL`, `uv run pytest tests/integration -v` passed both tests; with
+`.env` removed and nothing exported, the same command reported 2 skipped, not an
+error.
+
+## 2026-08-03 — M0.1 defect: local runtime could resolve to Python 3.14, not 3.12
+
+**Context:** on this environment, an unpinned interpreter resolved to Python
+3.14.4, while `ruff target-version`, `mypy python_version`, and CI's
+`setup-uv python-version` all say 3.12. Linting and type-checking one version
+while executing another is a real inconsistency, and `asyncpg` is a C extension
+without guaranteed wheels on a version this new — a failure mode that would have
+first surfaced as a confusing install error at M0.2, not here.
+
+**Decision:** `pyproject.toml`'s `requires-python` tightened from `">=3.12"` to
+`">=3.12,<3.13"`, and a `.python-version` file (containing `3.12`) added so `uv`
+selects a matching interpreter automatically instead of falling back to whatever
+`python3` resolves to on the machine. `ruff.target-version` (`py312`),
+`mypy.python_version` (`3.12`), and `ci.yml`'s `setup-uv python-version` (`3.12`)
+were already correct — confirmed, not changed.
+
+**Verification:** `uv sync` downloaded and used CPython 3.12.13 (visible in its
+output), installing `asyncpg==0.31.0` as a prebuilt wheel with no build step.
+`uv run python --version` reports `Python 3.12.13`. Full `uv run ruff check .`,
+`uv run ruff format --check .`, `uv run mypy --strict src/revenue_engine/core
+src/revenue_engine/db`, and `uv run pytest tests/unit tests/contracts
+tests/integration` all pass under the pinned interpreter. `uv.lock` is now
+committed alongside `.python-version` for reproducibility.
