@@ -41,8 +41,7 @@ async def run() -> int:
     try:
         await conn.execute(CREATE_TRACKING_TABLE)
         applied = {
-            row["filename"]
-            for row in await conn.fetch("SELECT filename FROM schema_migrations")
+            row["filename"] for row in await conn.fetch("SELECT filename FROM schema_migrations")
         }
 
         pending = [m for m in migrations if m.name not in applied]

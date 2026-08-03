@@ -113,3 +113,32 @@ way a merge gate should.
 **Consequence:** CI is expected to be red until the first tests land. This is
 intentional — the workflow is still exercised (setup, lint, mypy, migrate) end to
 end, and the pytest step becomes a real gate the moment M0.2's contract tests exist.
+
+## 2026-08-03 — M0.1 fixes: ruff scope, migrate.py formatting, .env.example default
+
+**Context:** first real run of `make check` surfaced two defects. (1) `ruff format
+--check` was reaching into fenced Python code blocks inside `docs/*.md` (confirmed:
+it reformatted the router snippet in `agent-contracts.md` and the `complete_json`
+call in `revenue-engine-build-spec.md`) — ruff formats embedded code in Markdown by
+default, and documentation prose is not this repo's code to reformat. (2)
+`scripts/migrate.py` itself was not format-clean (one comprehension ruff wanted
+wrapped differently).
+
+**Decision:**
+1. `[tool.ruff] extend-exclude = ["docs", "prompts", "schemas", "migrations"]` added
+   to `pyproject.toml`. Confirmed by listing every `.py` file in the repo: ruff now
+   only ever sees `scripts/`, `src/`, `tests/` — the only directories that contain
+   Python.
+2. `ruff format scripts/migrate.py` applied and saved.
+3. `.env.example`'s `POSTGRES_PASSWORD` changed from `changeme` to `revenue_engine`,
+   and `DATABASE_URL` updated to match — now byte-for-byte identical to
+   `docker-compose.yml`'s own `${VAR:-revenue_engine}` fallback defaults and to
+   `ci.yml`'s env block. Local-only throwaway credentials, not a secret.
+
+**Verification:** `ruff check .`, `ruff format --check .`, and
+`mypy --strict src/revenue_engine/core src/revenue_engine/db` all pass clean.
+
+**Consequence:** `make migrate` on a fresh clone still requires `cp .env.example
+.env` first (README quickstart already documents this) — that step was never
+optional; the fix ensures the copied values actually work against
+`docker-compose.yml` rather than mismatching on password.
