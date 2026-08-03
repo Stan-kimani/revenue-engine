@@ -1,10 +1,13 @@
-.PHONY: setup dev migrate worker test golden check
+.PHONY: setup dev reset migrate worker test golden check
 
 setup:
 	uv sync
 
 dev:
-	docker compose up
+	docker compose up -d
+
+reset:
+	docker compose down -v && docker compose up -d
 
 migrate:
 	uv run python scripts/migrate.py
@@ -29,4 +32,8 @@ golden:
 check: setup
 	uv run ruff check .
 	uv run ruff format --check .
-	uv run mypy --strict src/revenue_engine/core src/revenue_engine/db
+	@paths=""; \
+	for p in src/revenue_engine/core src/revenue_engine/db; do \
+		if [ -d "$$p" ]; then paths="$$paths $$p"; else echo "Skipping mypy for $$p (not created yet)."; fi; \
+	done; \
+	if [ -n "$$paths" ]; then uv run mypy --strict $$paths; else echo "Nothing to type-check yet."; fi

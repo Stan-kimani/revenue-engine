@@ -246,3 +246,45 @@ output), installing `asyncpg==0.31.0` as a prebuilt wheel with no build step.
 src/revenue_engine/db`, and `uv run pytest tests/unit tests/contracts
 tests/integration` all pass under the pinned interpreter. `uv.lock` is now
 committed alongside `.python-version` for reproducibility.
+
+## 2026-08-03 — M0.1 polish: reset target, detached dev, mypy guard, non-transactional migrations
+
+Four small fixes ahead of M0.2, in preparation for iterating on migration 0001
+repeatedly.
+
+1. **`make reset`** added: `docker compose down -v && docker compose up -d` —
+   a deliberate, named clean-slate command rather than a flag someone has to
+   remember to add to `down`.
+
+2. **`make dev` runs detached** (`docker compose up -d`, was `up`). Foreground
+   blocked the terminal on every invocation; `reset` also runs detached for the
+   same reason.
+
+3. **`make check`'s mypy step now guards on directory existence.** It loops
+   over `src/revenue_engine/core` and `src/revenue_engine/db`, skips (with a
+   printed note) any that don't exist, runs `mypy --strict` only against
+   whatever does exist, and prints "Nothing to type-check yet." rather than
+   failing if neither does. Verified all three states directly (both present,
+   neither present, only one present) by temporarily moving the directories
+   aside and back — the git tree was unaffected (`git status --short src/`
+   showed nothing after restoring). `ci.yml` was deliberately left unchanged:
+   `actions/checkout` always pulls the tracked `__init__.py` files, so CI isn't
+   exposed to the scenario this guards against the way a stray local clone
+   might be, and only `make check` was asked for.
+
+4. **`scripts/migrate.py` supports non-transactional migrations.** A migration
+   file whose exact first line is the comment `-- migrate: no-transaction` now
+   runs as a single autocommit statement with no `conn.transaction()` wrapper,
+   with the `schema_migrations` row inserted in a separate statement
+   immediately after it succeeds. Needed for `CREATE INDEX CONCURRENTLY` and
+   some `ALTER TYPE ... ADD VALUE` forms, which Postgres refuses to run inside
+   a transaction block. Documented at the top of `migrate.py` and, more fully
+   (including partial-failure recovery — there is no transaction to roll back,
+   so a failed non-transactional migration is not automatically undone and is
+   not recorded as applied), in a new "Migrations" section of `docs/runbook.md`.
+   Not needed for migration 0001 against an empty database; will matter the
+   first time a `CONCURRENTLY` index runs against real data.
+
+**Verification:** all three `tests/integration/test_migrate.py` tests
+(including the new `test_no_transaction_migration_applies_and_is_recorded`)
+pass against a real, disposable Postgres instance.

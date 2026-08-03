@@ -88,3 +88,47 @@ async def test_running_twice_is_idempotent(
         assert row_count == 0
     finally:
         await conn.close()
+
+
+async def test_no_transaction_migration_applies_and_is_recorded(
+    tmp_path, monkeypatch, database_url, clean_schema_migrations
+):
+    monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
+
+    migration_file = tmp_path / "0001_no_transaction.sql"
+    migration_file.write_text(
+        "-- migrate: no-transaction\n"
+        "CREATE TABLE no_transaction_smoke_test (id serial primary key);\n"
+    )
+
+    conn = await asyncpg.connect(database_url)
+    try:
+        await conn.execute("DROP TABLE IF EXISTS no_transaction_smoke_test")
+    finally:
+        await conn.close()
+
+    try:
+        exit_code = await migrate.run()
+        assert exit_code == 0
+
+        conn = await asyncpg.connect(database_url)
+        try:
+            recorded = await conn.fetchval(
+                "SELECT count(*) FROM schema_migrations WHERE filename = $1",
+                "0001_no_transaction.sql",
+            )
+            assert recorded == 1
+
+            table_exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'no_transaction_smoke_test')"
+            )
+            assert table_exists is True
+        finally:
+            await conn.close()
+    finally:
+        conn = await asyncpg.connect(database_url)
+        try:
+            await conn.execute("DROP TABLE IF EXISTS no_transaction_smoke_test")
+        finally:
+            await conn.close()
