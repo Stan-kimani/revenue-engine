@@ -402,3 +402,110 @@ idempotency-key no-op re-emission, and the full job lifecycle (enqueue → claim
 via SKIP LOCKED → complete, and fail-with-retry vs. fail-to-dead-letter).
 `ruff check`, `ruff format --check`, and `mypy --strict` on `core/` and `db/`
 are all clean.
+
+## 2026-08-04 — M0.2 corrections: deferred exclusion, embeddings scope/verified, evidence field, deferral is not an error
+
+Reworked the 2026-08-03 M0.2 delivery against a more precise re-specification.
+Four corrections, one reasoning task, two additions.
+
+**The `deferred`-exclusion reasoning (asked for explicitly, not a correction):**
+the stated exclusion list for `one_active_lead_per_contact` /
+`one_active_lead_per_company` omitted `'deferred'`. Concluded it must be
+added: `lead.deferred`'s documented recovery path (event-catalog.md §3)
+creates a SECOND `leads` row, for the same `company_id`, with
+`status='deferred'`. If `'deferred'` is not excluded from the partial index's
+`WHERE` clause, that second row still matches the predicate — so inserting
+the deferral placeholder would itself throw the exact unique violation it
+exists to represent, making the documented flow impossible to implement.
+Separately, semantically: a deferred lead is inactive by definition and must
+not occupy the one-active-thread slot. Added to both indexes' exclusion
+lists. Verified end to end:
+`test_second_active_lead_same_company_returns_deferral_not_exception` inserts
+the deferred row successfully and confirms it doesn't collide.
+
+**Correction — `create_lead()`'s company-level violation is not an error.**
+Previously both single-thread constraints raised `DuplicateActiveLeadError`.
+Now: `one_active_lead_per_company` is caught, a `status='deferred'` row is
+inserted (inside a transaction, alongside a lookup of `blocked_by_lead_id`),
+and a new `LeadCreationResult(lead, deferred, blocked_by_lead_id)` is
+returned — never raised. `one_active_lead_per_contact` still raises
+`DuplicateActiveLeadError`, since there's no documented business-outcome
+event for that case (matches the required test list: "second active lead for
+the same contact **is rejected**" vs. "...same company **returns the
+deferral result, not an exception**"). If the deferred-placeholder insert
+itself collides with a *different* active lead for the same contact (a rare
+double-collision), that exception is not caught and propagates as-is —
+undocumented edge case, not silently handled.
+
+**Correction — `embeddings.vector` reverted to dimensionless, no index.** The
+2026-08-03 entry had already decided this (deferred, "Recommended" per the
+user's own earlier choice); a subsequent re-specification asked for
+`vector(1536)` + hnsw, which would have silently reversed that decision.
+Reverted back to dimensionless/no-index per explicit correction. Recorded
+here as a hard requirement, not a suggestion: **fixing the dimension and
+creating the ANN index is a prerequisite of whichever milestone first
+generates embeddings** (Phase 2/3, `core/memory.py`'s first `embed()` call) —
+do not defer past that point, and do not guess the dimension; picking wrong
+means re-embedding every stored chunk through a different provider, at cost.
+
+**Correction — `evidence` added to the attribute-provenance envelope.**
+entity-model.md §2's literal example was `{value, source, confidence, run_id,
+observed_at}` — no `evidence`. Confirmed as a doc gap: `evidence` is the
+snippet or reasoning behind `value`, and without it, provenance degrades to
+an unfalsifiable confidence number. Envelope is now `{value, confidence,
+evidence, source, run_id, observed_at}` — model supplies the first three,
+code adds the last three. `schemas/entities/attribute.json` updated
+(`evidence` required, nullable — non-LLM sources have no natural text
+evidence). entity-model.md §2 updated to match, with a correction note rather
+than silently rewriting history.
+
+**Addition — `embeddings` gains `scope`, `ref_company_id`, `verified`.**
+`scope` (`global | industry | account`) is orthogonal to `kind` (what the
+content is) — a docs gap, not a prior misreading, per the correction. `kind`
+answers "what is this," `scope` answers "who can retrieve it." `verified`
+(default `false`) is required by competitive-deltas.md D4: only verified
+proof records may be retrieved for outreach, and that filter is unenforceable
+without a column to filter on. Both entity-model.md §7 and build-spec §3.4
+were updated to name `scope`, since neither previously did.
+
+**Addition — flagged, not built:** `deals.stage` still has no FK to
+`pipeline_stages.key`, and `pipeline_stages` is still empty after this
+migration (both unchanged from 2026-08-03, confirmed correct for M0.2).
+Recording explicitly: stage values are validated nowhere yet, at the DB or
+data level. Before the first deal is created (M1.4), code-level
+stage-transition validation against a config transition table must exist,
+and `pipeline_stages` must be seeded (`scripts/seed_dev.py`, not written
+yet).
+
+**models.py**: converted from dataclasses to Pydantic `BaseModel`, per this
+round's explicit spec. Added `LeadCreationResult`.
+
+**New tests, all passing against a real Postgres instance**, matching the
+required list exactly (marked `@pytest.mark.protected` — 8 total, confirmed
+via `pytest -m protected --collect-only`):
+`test_migration_0001_applies_cleanly_and_is_idempotent_on_empty_database`
+(applies the real `migrations/0001_init.sql`, not a monkeypatched empty dir,
+against a disposable `CREATE DATABASE`-isolated database — the shared test
+database other tests reuse is never touched),
+`test_second_active_lead_same_contact_is_rejected`,
+`test_second_active_lead_same_company_returns_deferral_not_exception`,
+`test_outbound_lead_with_null_problem_statement_inserts_fine`,
+`test_inbound_lead_with_null_problem_statement_is_rejected`,
+`test_duplicate_provider_message_id_is_rejected`,
+`test_duplicate_idempotency_key_is_rejected` (raw-SQL constraint test,
+distinct from the pre-existing `emit_event` no-op behaviour test — both are
+kept), `test_closing_deal_without_fx_rate_is_rejected`.
+
+**`docs/verification-loop.md` does not exist in this repository** — checked
+before starting this round of work. Not fabricated; the §7 reporting format
+(real command output, `git diff --stat HEAD -- tests/`, NOT VERIFIED section)
+was followed as described inline in the instruction instead.
+
+**Full verification:** migration 0001 (corrected) applied cleanly to a fresh
+Postgres 16 + pgvector instance — 23 tables, 29 foreign keys (28 + the new
+`embeddings.ref_company_id` FK), `embeddings.vector` confirmed dimensionless
+via `\d embeddings`, `deals.closed_deal_requires_frozen_fx` and
+`embeddings.ref_company_id_required_for_account_scope` confirmed present via
+`\d`. All 53 tests (`tests/unit` + `tests/contracts` + `tests/integration`)
+pass, including all 8 protected tests. `ruff check`, `ruff format --check`,
+and `mypy --strict` on `core/` and `db/` are clean.

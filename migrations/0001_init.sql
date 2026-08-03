@@ -155,7 +155,18 @@ CREATE TABLE deals (
     closed_at          timestamptz,
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now(),
-    deleted_at         timestamptz
+    deleted_at         timestamptz,
+    -- A closed deal (outcome set) must have its FX rate frozen — a closed
+    -- deal with no rate is a data-integrity bug, not a valid state. This
+    -- CHECK only stops that invalid state from existing; it does NOT enforce
+    -- immutability of fx_rate_to_base after close (a CHECK re-evaluates on
+    -- every UPDATE, so it can't tell "set at close" from "changed later").
+    -- That immutability is repositories.close_deal()'s job (a later
+    -- milestone — deals repositories are out of M0.2's scope) and must be
+    -- enforced there, not assumed from this constraint.
+    CONSTRAINT closed_deal_requires_frozen_fx CHECK (
+        outcome IS NULL OR (fx_rate_to_base IS NOT NULL AND fx_frozen_at IS NOT NULL)
+    )
 );
 
 CREATE TABLE messages (
@@ -319,21 +330,41 @@ CREATE TABLE agent_runs (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 
--- vector has no fixed dimension yet — deliberate. No embedding provider is
--- specified anywhere in the docs (build-spec §7's Integrations table covers
--- only the completions LLM), and nothing before Phase 2/3 (core/memory.py,
--- the first embed() call) generates embeddings. A fixed dimension and its
--- ivfflat/hnsw index are added in a later migration once a real provider is
--- chosen — see docs/decisions.md.
+-- vector has no fixed dimension yet, and no ANN index — deliberate. No
+-- embedding provider is specified anywhere in the docs (build-spec §7's
+-- Integrations table covers only the completions LLM), and nothing before
+-- Phase 2/3 (core/memory.py, the first embed() call) generates embeddings.
+-- Sequential scan is fine at zero/near-zero rows. Fixing the dimension and
+-- adding an ivfflat/hnsw index is a REQUIRED PREREQUISITE of whichever
+-- milestone first generates embeddings — do not defer it past that point,
+-- and do not guess a dimension now: it is the most expensive column to
+-- change later (wrong dimension means re-embedding every stored chunk
+-- through a different provider, at cost). See docs/decisions.md.
+--
+-- scope vs kind (entity-model.md §7, added 2026-08-04): orthogonal.
+-- kind = what the content IS (transcript, email, proof, objection_precedent).
+-- scope = retrieval visibility tier. ref_company_id is required exactly when
+-- scope = 'account' (which company), and must be null otherwise.
+-- verified: competitive-deltas.md D4 — only verified=true rows may ever be
+-- retrieved for outreach. Unverified/aspirational content must be filterable
+-- out, not merely flagged, or it eventually gets asserted to a prospect as
+-- fact.
 CREATE TABLE embeddings (
-    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    kind       text NOT NULL,
-    ref_table  text NOT NULL,
-    ref_id     uuid NOT NULL,
-    chunk      text NOT NULL,
-    vector     vector,
-    industry   text,
-    created_at timestamptz NOT NULL DEFAULT now()
+    id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind           text NOT NULL,
+    scope          text NOT NULL CHECK (scope IN ('global', 'industry', 'account')),
+    ref_company_id uuid,
+    ref_table      text NOT NULL,
+    ref_id         uuid NOT NULL,
+    chunk          text NOT NULL,
+    vector         vector,
+    industry       text,
+    verified       boolean NOT NULL DEFAULT false,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ref_company_id_required_for_account_scope CHECK (
+        (scope = 'account' AND ref_company_id IS NOT NULL)
+        OR (scope != 'account' AND ref_company_id IS NULL)
+    )
 );
 
 -- Config-seeded (build-spec §5.1), not by this migration — seeding is
@@ -422,14 +453,25 @@ CREATE INDEX leads_band_idx ON leads (band);
 
 -- D2 / R1: exactly one active lead per contact, and per company. "Active"
 -- means not in a terminal status. Enforced in the DB, not application logic.
+--
+-- 'deferred' is included in the exclusion list, not just the four terminal
+-- statuses — this is required, not optional. lead.deferred's own documented
+-- recovery path (event-catalog.md §3) creates a SECOND leads row, for the
+-- same company_id, with status='deferred'. If 'deferred' were NOT excluded
+-- here, that second row would still match this index's predicate — so
+-- inserting the deferral placeholder would itself throw the exact unique
+-- violation it exists to represent, making the documented flow impossible.
+-- Semantically this is also correct on its own terms: a deferred lead is
+-- explicitly inactive (parked, not being pursued) and must not occupy the
+-- one-active-thread slot for its contact or company.
 CREATE UNIQUE INDEX one_active_lead_per_contact
     ON leads (contact_id)
-    WHERE status NOT IN ('converted', 'disqualified', 'unsubscribed', 'dormant')
+    WHERE status NOT IN ('deferred', 'converted', 'disqualified', 'unsubscribed', 'dormant')
       AND deleted_at IS NULL;
 
 CREATE UNIQUE INDEX one_active_lead_per_company
     ON leads (company_id)
-    WHERE status NOT IN ('converted', 'disqualified', 'unsubscribed', 'dormant')
+    WHERE status NOT IN ('deferred', 'converted', 'disqualified', 'unsubscribed', 'dormant')
       AND deleted_at IS NULL
       AND company_id IS NOT NULL;
 
@@ -471,6 +513,8 @@ CREATE INDEX agent_runs_trigger_event_idx ON agent_runs (trigger_event);
 CREATE INDEX embeddings_ref_idx ON embeddings (ref_table, ref_id);
 CREATE INDEX embeddings_kind_idx ON embeddings (kind);
 CREATE INDEX embeddings_industry_idx ON embeddings (industry);
+CREATE INDEX embeddings_scope_idx ON embeddings (scope);
+CREATE INDEX embeddings_verified_idx ON embeddings (verified);
 
 CREATE INDEX sequence_runs_sequence_id_idx ON sequence_runs (sequence_id);
 CREATE INDEX sequence_runs_lead_id_idx ON sequence_runs (lead_id);
@@ -532,6 +576,9 @@ ALTER TABLE sequence_runs
 
 ALTER TABLE campaign_assets
     ADD CONSTRAINT campaign_assets_campaign_id_fkey FOREIGN KEY (campaign_id) REFERENCES campaigns (id);
+
+ALTER TABLE embeddings
+    ADD CONSTRAINT embeddings_ref_company_id_fkey FOREIGN KEY (ref_company_id) REFERENCES companies (id);
 
 -- embeddings.ref_table/ref_id are a deliberate polymorphic reference (chunks
 -- from meetings, messages, learnings, etc.) — no single FK target is

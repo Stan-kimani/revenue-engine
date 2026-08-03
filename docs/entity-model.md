@@ -28,20 +28,31 @@ Every value inside an `attributes` JSONB column is an object, never a bare scala
 {
   "industry": {
     "value": "B2B SaaS",
-    "source": "llm:enrich_company",
     "confidence": 0.82,
+    "evidence": "Homepage copy: \"the operating system for B2B SaaS finance teams\"",
+    "source": "llm:enrich_company",
     "run_id": "a4f1...",
     "observed_at": "2026-07-23T09:14:00Z"
   },
   "employee_count": {
     "value": 12,
-    "source": "provider:apollo",
     "confidence": 1.0,
+    "evidence": null,
+    "source": "provider:apollo",
     "run_id": null,
     "observed_at": "2026-07-23T09:14:00Z"
   }
 }
 ```
+
+**Corrected 2026-08-04** (was previously `{value, source, confidence, run_id,
+observed_at}`, missing `evidence`): the model supplies `value`, `confidence`,
+and `evidence` — code adds `source`, `run_id`, and `observed_at` when writing
+the envelope. `evidence` is the snippet or reasoning that produced `value`;
+without it, provenance degrades to "confidence 0.82" with nothing to check it
+against, which defeats the point of storing provenance at all. `evidence` may
+be `null` for non-LLM sources with no natural text evidence (provider API
+responses, human entry).
 
 `source` is always `<kind>:<detail>` where kind is one of `llm`, `provider`, `human`,
 `derived`, `webform`. Enforced by `schemas/entities/attribute.json` and validated in
@@ -312,6 +323,22 @@ concrete need appears. Add them in a later migration, not now.
 `sequences`, `sequence_runs`, `campaign_assets`, `learnings`. These are locked by
 build-spec §5.1 and need no domain decisions. They will be written directly into
 migration 0001 alongside the entities above.
+
+**Added 2026-08-04 — `embeddings` needs `scope`, not just `kind`.** The two are
+orthogonal: `kind` is what the content *is* (transcript, email, proof,
+objection_precedent); `scope` is the retrieval visibility tier —
+`'global' | 'industry' | 'account'`. A proof record can be global or
+industry-scoped; both are `kind = 'proof'`. `ref_company_id` is required when
+`scope = 'account'` (which company it's scoped to) and must be null otherwise.
+`memory.semantic_search` filters on `scope` + `industry` together, not `kind`
+alone. `embeddings` also needs `verified boolean not null default false` —
+competitive-deltas.md D4 requires only verified proof records be retrievable
+for outreach; without this column that filter can't be enforced, and
+unverified or aspirational content would eventually be retrieved and asserted
+to a prospect as fact. `vector` itself is intentionally left with no fixed
+dimension in migration 0001 — no embedding provider is named anywhere in these
+docs, and fixing the dimension is the most expensive column to change later
+(it means re-embedding every stored chunk). See docs/decisions.md.
 
 ---
 

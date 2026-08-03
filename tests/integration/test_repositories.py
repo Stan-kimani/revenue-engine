@@ -1,9 +1,13 @@
 """Integration tests for db/repositories.py (companies, contacts, leads,
 events, jobs — build-spec §10 M0.2) against a real Postgres instance.
+
+Tests marked @pytest.mark.protected encode a business rule from an explicit
+instruction and must not be weakened to make them pass.
 """
 
 from __future__ import annotations
 
+import datetime
 import os
 import uuid
 
@@ -33,7 +37,7 @@ async def conn(database_url: str):
     finally:
         # Truncate rather than drop — migration 0001 owns the schema.
         await connection.execute(
-            "TRUNCATE companies, contacts, leads, lead_scores, deals, events, jobs "
+            "TRUNCATE companies, contacts, leads, lead_scores, deals, messages, events, jobs "
             "RESTART IDENTITY CASCADE"
         )
         await connection.close()
@@ -42,8 +46,9 @@ async def conn(database_url: str):
 def _envelope(value: object, source: str = "provider:test") -> dict:
     return {
         "value": value,
-        "source": source,
         "confidence": 1.0,
+        "evidence": None,
+        "source": source,
         "run_id": None,
         "observed_at": "2026-08-03T00:00:00Z",
     }
@@ -137,6 +142,11 @@ async def test_upsert_contact_records_employment_history_on_company_change(
     assert history[0]["company_id"] == str(company_a.id)
 
 
+async def test_contact_email_status_defaults_to_unverified(conn: asyncpg.Connection):
+    contact = await repo.upsert_contact(conn, email="jane@acme.com")
+    assert contact.email_status == EmailStatus.UNVERIFIED
+
+
 # ============================================================================
 # Leads
 # ============================================================================
@@ -145,15 +155,17 @@ async def test_upsert_contact_records_employment_history_on_company_change(
 async def test_create_lead_defaults_to_new_status(conn: asyncpg.Connection):
     contact = await repo.upsert_contact(conn, email="jane@acme.com")
 
-    lead = await repo.create_lead(
+    result = await repo.create_lead(
         conn, contact_id=contact.id, industry_pack="b2b-service-firms", source=LeadSource.DISCOVERY
     )
 
-    assert lead.status == LeadStatus.NEW
-    assert lead.band is None
+    assert result.deferred is False
+    assert result.lead.status == LeadStatus.NEW
+    assert result.lead.band is None
 
 
-async def test_create_lead_blocks_second_active_lead_same_contact(conn: asyncpg.Connection):
+@pytest.mark.protected
+async def test_second_active_lead_same_contact_is_rejected(conn: asyncpg.Connection):
     contact = await repo.upsert_contact(conn, email="jane@acme.com")
     await repo.create_lead(
         conn, contact_id=contact.id, industry_pack="b2b-service-firms", source=LeadSource.DISCOVERY
@@ -169,35 +181,54 @@ async def test_create_lead_blocks_second_active_lead_same_contact(conn: asyncpg.
     assert exc_info.value.constraint_name == "one_active_lead_per_contact"
 
 
-async def test_create_lead_blocks_second_active_lead_same_company_different_contact(
+@pytest.mark.protected
+async def test_second_active_lead_same_company_returns_deferral_not_exception(
     conn: asyncpg.Connection,
 ):
     company = await repo.upsert_company(conn, name="Acme", domain="acme.com")
     contact_a = await repo.upsert_contact(conn, email="a@acme.com", company_id=company.id)
     contact_b = await repo.upsert_contact(conn, email="b@acme.com", company_id=company.id)
 
-    await repo.create_lead(
+    first = await repo.create_lead(
         conn,
         contact_id=contact_a.id,
         company_id=company.id,
         industry_pack="b2b-service-firms",
         source=LeadSource.DISCOVERY,
     )
+    assert first.deferred is False
 
-    with pytest.raises(DuplicateActiveLeadError) as exc_info:
-        await repo.create_lead(
-            conn,
-            contact_id=contact_b.id,
-            company_id=company.id,
-            industry_pack="b2b-service-firms",
-            source=LeadSource.DISCOVERY,
-        )
-    assert exc_info.value.constraint_name == "one_active_lead_per_company"
+    second = await repo.create_lead(
+        conn,
+        contact_id=contact_b.id,
+        company_id=company.id,
+        industry_pack="b2b-service-firms",
+        source=LeadSource.DISCOVERY,
+    )
+
+    assert second.deferred is True
+    assert second.lead.status == LeadStatus.DEFERRED
+    assert second.blocked_by_lead_id == first.lead.id
 
 
-async def test_create_lead_requires_problem_statement_for_inbound_sources(
-    conn: asyncpg.Connection,
-):
+@pytest.mark.protected
+async def test_outbound_lead_with_null_problem_statement_inserts_fine(conn: asyncpg.Connection):
+    contact = await repo.upsert_contact(conn, email="jane@acme.com")
+
+    result = await repo.create_lead(
+        conn,
+        contact_id=contact.id,
+        industry_pack="b2b-service-firms",
+        source=LeadSource.DISCOVERY,
+        problem_statement=None,
+    )
+
+    assert result.deferred is False
+    assert result.lead.problem_statement is None
+
+
+@pytest.mark.protected
+async def test_inbound_lead_with_null_problem_statement_is_rejected(conn: asyncpg.Connection):
     contact = await repo.upsert_contact(conn, email="jane@acme.com")
 
     with pytest.raises(asyncpg.CheckViolationError):
@@ -212,14 +243,14 @@ async def test_create_lead_requires_problem_statement_for_inbound_sources(
 
 async def test_update_lead_status_transitions_and_persists(conn: asyncpg.Connection):
     contact = await repo.upsert_contact(conn, email="jane@acme.com")
-    lead = await repo.create_lead(
+    result = await repo.create_lead(
         conn, contact_id=contact.id, industry_pack="b2b-service-firms", source=LeadSource.DISCOVERY
     )
 
-    updated = await repo.update_lead_status(conn, lead.id, LeadStatus.ENRICHING)
+    updated = await repo.update_lead_status(conn, result.lead.id, LeadStatus.ENRICHING)
 
     assert updated.status == LeadStatus.ENRICHING
-    reread = await repo.get_lead(conn, lead.id)
+    reread = await repo.get_lead(conn, result.lead.id)
     assert reread is not None
     assert reread.status == LeadStatus.ENRICHING
 
@@ -274,6 +305,33 @@ async def test_get_event_roundtrip(conn: asyncpg.Connection):
     assert fetched.type == "lead.enriched"
 
 
+@pytest.mark.protected
+async def test_duplicate_idempotency_key_is_rejected(conn: asyncpg.Connection):
+    """Constraint-level test, distinct from the no-op-via-emit_event test
+    above: a raw duplicate INSERT (bypassing ON CONFLICT) must fail."""
+    key = f"lead:{uuid.uuid4()}:captured"
+    await conn.execute(
+        "INSERT INTO events (type, actor, correlation_id, idempotency_key, payload) "
+        "VALUES ($1, $2, $3, $4, $5::jsonb)",
+        "lead.captured",
+        "agent:leadgen",
+        uuid.uuid4(),
+        key,
+        "{}",
+    )
+
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await conn.execute(
+            "INSERT INTO events (type, actor, correlation_id, idempotency_key, payload) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb)",
+            "lead.enriched",
+            "agent:leadgen",
+            uuid.uuid4(),
+            key,
+            "{}",
+        )
+
+
 # ============================================================================
 # Jobs (queue)
 # ============================================================================
@@ -293,8 +351,6 @@ async def test_enqueue_and_claim_job(conn: asyncpg.Connection):
 
 
 async def test_claim_job_skips_future_run_after(conn: asyncpg.Connection):
-    import datetime
-
     future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)
     await repo.enqueue_job(conn, type="leadgen.enrich", payload={}, run_after=future)
 
@@ -309,8 +365,6 @@ async def test_complete_job(conn: asyncpg.Connection):
 
 
 async def test_mark_job_failed_with_retry_goes_back_to_pending(conn: asyncpg.Connection):
-    import datetime
-
     job = await repo.enqueue_job(conn, type="leadgen.enrich", payload={})
     retry_at = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=5)
 
@@ -331,6 +385,47 @@ async def test_mark_job_failed_without_retry_dead_letters(conn: asyncpg.Connecti
     assert failed.status == JobStatus.DEAD_LETTER
 
 
-async def test_contact_email_status_defaults_to_unverified(conn: asyncpg.Connection):
+# ============================================================================
+# Constraints on tables outside M0.2's repository scope (messages, deals) —
+# exercised via raw SQL since messages/deals repositories don't exist yet.
+# ============================================================================
+
+
+@pytest.mark.protected
+async def test_duplicate_provider_message_id_is_rejected(conn: asyncpg.Connection):
     contact = await repo.upsert_contact(conn, email="jane@acme.com")
-    assert contact.email_status == EmailStatus.UNVERIFIED
+    lead = await repo.create_lead(
+        conn, contact_id=contact.id, industry_pack="b2b-service-firms", source=LeadSource.DISCOVERY
+    )
+
+    await conn.execute(
+        "INSERT INTO messages (lead_id, contact_id, direction, channel, provider_message_id) "
+        "VALUES ($1, $2, 'outbound', 'email', $3)",
+        lead.lead.id,
+        contact.id,
+        "gmail-msg-123",
+    )
+
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await conn.execute(
+            "INSERT INTO messages (lead_id, contact_id, direction, channel, provider_message_id) "
+            "VALUES ($1, $2, 'outbound', 'email', $3)",
+            lead.lead.id,
+            contact.id,
+            "gmail-msg-123",
+        )
+
+
+@pytest.mark.protected
+async def test_closing_deal_without_fx_rate_is_rejected(conn: asyncpg.Connection):
+    contact = await repo.upsert_contact(conn, email="jane@acme.com")
+    lead = await repo.create_lead(
+        conn, contact_id=contact.id, industry_pack="b2b-service-firms", source=LeadSource.DISCOVERY
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await conn.execute(
+            "INSERT INTO deals (lead_id, stage, outcome, value_amount, currency) "
+            "VALUES ($1, 'closed_won', 'won', 5000.00, 'USD')",
+            lead.lead.id,
+        )

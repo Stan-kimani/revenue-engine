@@ -1,4 +1,4 @@
-"""Typed row models. No ORM — plain dataclasses mirroring migrations/0001_init.sql.
+"""Typed row models. Pydantic, no ORM — mirroring migrations/0001_init.sql.
 
 Only the entities named in build-spec §10 M0.2 (companies, contacts, leads,
 events, jobs) are modelled here. Other tables exist in the database after
@@ -12,12 +12,13 @@ what's stored.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
+
+from pydantic import BaseModel
 
 
 class EmailStatus(StrEnum):
@@ -97,8 +98,7 @@ class JobStatus(StrEnum):
     DEAD_LETTER = "dead_letter"
 
 
-@dataclass
-class Company:
+class Company(BaseModel):
     id: UUID
     name: str
     domain: str | None
@@ -111,8 +111,7 @@ class Company:
     deleted_at: datetime | None
 
 
-@dataclass
-class Contact:
+class Contact(BaseModel):
     id: UUID
     email: str
     email_status: EmailStatus
@@ -128,8 +127,7 @@ class Contact:
     deleted_at: datetime | None
 
 
-@dataclass
-class Lead:
+class Lead(BaseModel):
     id: UUID
     contact_id: UUID
     company_id: UUID | None
@@ -152,8 +150,29 @@ class Lead:
     deleted_at: datetime | None
 
 
-@dataclass
-class Event:
+class LeadCreationResult(BaseModel):
+    """Return type of repositories.create_lead().
+
+    The single-thread rule (one_active_lead_per_company) blocking a create is
+    a normal business outcome (event-catalog.md §3), not an error — it never
+    raises. `lead` is always a real, persisted row either way: the newly
+    created active lead when `deferred` is False, or the `status='deferred'`
+    placeholder row event-catalog.md §3 documents when it's True. The caller
+    (a later milestone — core/events.py doesn't exist yet) emits
+    `lead.deferred` when `deferred` is True.
+
+    The contact-level constraint (one_active_lead_per_contact) is a different
+    case and is NOT represented here — create_lead() raises
+    DuplicateActiveLeadError for that instead, since there is no documented
+    business-outcome event for it.
+    """
+
+    lead: Lead
+    deferred: bool
+    blocked_by_lead_id: UUID | None = None
+
+
+class Event(BaseModel):
     event_id: UUID
     type: str
     version: int
@@ -166,8 +185,7 @@ class Event:
     processed_at: datetime | None
 
 
-@dataclass
-class Job:
+class Job(BaseModel):
     id: UUID
     type: str
     payload: dict[str, Any]

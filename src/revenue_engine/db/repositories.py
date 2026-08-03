@@ -36,6 +36,7 @@ from .models import (
     JobStatus,
     Lead,
     LeadBand,
+    LeadCreationResult,
     LeadSource,
     LeadStatus,
     PainCategory,
@@ -244,6 +245,12 @@ async def get_lead(conn: asyncpg.Connection, lead_id: UUID) -> Lead | None:
     return _row_to_lead(row) if row else None
 
 
+_LEAD_INSERT_COLUMNS = """
+    contact_id, company_id, campaign_id, industry_pack, source, status,
+    problem_statement, pain_category, team_size_band, budget_band, budget_source
+"""
+
+
 async def create_lead(
     conn: asyncpg.Connection,
     *,
@@ -257,22 +264,30 @@ async def create_lead(
     team_size_band: TeamSizeBand | None = None,
     budget_band: BudgetBand | None = None,
     budget_source: BudgetSource | None = None,
-) -> Lead:
+) -> LeadCreationResult:
     """Create a new lead ("pursuit").
 
-    Raises DuplicateActiveLeadError — never a raw UniqueViolation — if this
-    would break the single-thread rule (one active lead per contact, D2; one
-    per company, R1). event-catalog.md §3 requires the constraint violation
-    be caught and converted, so a caller can emit `lead.deferred` instead of
-    crashing.
+    The two single-thread constraints are handled differently, deliberately:
+
+    - Violating `one_active_lead_per_company` (R1) is a normal business
+      outcome (event-catalog.md §3), never an error. It's caught here, and a
+      second row is inserted with `status='deferred'` — event-catalog.md §3's
+      documented recovery path — instead of raising. The caller (a later
+      milestone) emits `lead.deferred`; this function never does, since
+      `core/events.py` doesn't exist yet.
+    - Violating `one_active_lead_per_contact` (D2) has no analogous
+      documented business outcome — it raises `DuplicateActiveLeadError`, not
+      a raw `UniqueViolationError`.
+
+    If the deferred-placeholder insert itself fails (e.g. this contact also
+    already has another active lead elsewhere — a rare double-collision), that
+    exception is not caught here and propagates as-is.
     """
     try:
         row = await conn.fetchrow(
-            """
-            INSERT INTO leads (contact_id, company_id, campaign_id, industry_pack, source,
-                                problem_statement, pain_category, team_size_band,
-                                budget_band, budget_source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            f"""
+            INSERT INTO leads ({_LEAD_INSERT_COLUMNS})
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *
             """,
             contact_id,
@@ -280,6 +295,7 @@ async def create_lead(
             campaign_id,
             industry_pack,
             source.value,
+            LeadStatus.NEW.value,
             problem_statement,
             pain_category.value if pain_category else None,
             team_size_band.value if team_size_band else None,
@@ -287,10 +303,48 @@ async def create_lead(
             budget_source.value if budget_source else None,
         )
     except asyncpg.UniqueViolationError as exc:
-        raise DuplicateActiveLeadError(exc.constraint_name or "unknown") from exc
+        if exc.constraint_name != "one_active_lead_per_company":
+            raise DuplicateActiveLeadError(exc.constraint_name or "unknown") from exc
+
+        async with conn.transaction():
+            blocking = await conn.fetchrow(
+                """
+                SELECT id FROM leads
+                WHERE company_id = $1
+                  AND status NOT IN
+                      ('deferred', 'converted', 'disqualified', 'unsubscribed', 'dormant')
+                  AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                company_id,
+            )
+            deferred_row = await conn.fetchrow(
+                f"""
+                INSERT INTO leads ({_LEAD_INSERT_COLUMNS})
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                RETURNING *
+                """,
+                contact_id,
+                company_id,
+                campaign_id,
+                industry_pack,
+                source.value,
+                LeadStatus.DEFERRED.value,
+                problem_statement,
+                pain_category.value if pain_category else None,
+                team_size_band.value if team_size_band else None,
+                budget_band.value if budget_band else None,
+                budget_source.value if budget_source else None,
+            )
+        assert deferred_row is not None
+        return LeadCreationResult(
+            lead=_row_to_lead(deferred_row),
+            deferred=True,
+            blocked_by_lead_id=blocking["id"] if blocking else None,
+        )
 
     assert row is not None
-    return _row_to_lead(row)
+    return LeadCreationResult(lead=_row_to_lead(row), deferred=False)
 
 
 async def update_lead_status(conn: asyncpg.Connection, lead_id: UUID, status: LeadStatus) -> Lead:

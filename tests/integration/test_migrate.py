@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import uuid
 from pathlib import Path
 from types import ModuleType
 
@@ -88,6 +89,70 @@ async def test_running_twice_is_idempotent(
         assert row_count == 0
     finally:
         await conn.close()
+
+
+@pytest.mark.protected
+async def test_migration_0001_applies_cleanly_and_is_idempotent_on_empty_database(
+    database_url: str, monkeypatch
+):
+    """Applies the REAL migrations/0001_init.sql (MIGRATIONS_DIR unpatched)
+    against a genuinely empty, disposable database — not the shared test
+    database other tests in this suite reuse, and not a monkeypatched empty
+    directory like the tests above. A fresh CREATE DATABASE within the same
+    Postgres instance is the isolation boundary.
+    """
+    base_url, _, _ = database_url.rpartition("/")
+    test_db_name = f"test_m0001_{uuid.uuid4().hex[:12]}"
+    test_db_url = f"{base_url}/{test_db_name}"
+
+    admin_conn = await asyncpg.connect(database_url)
+    try:
+        # Identifier, not a value — cannot be parameterised. Safe: machine-generated
+        # uuid suffix, never user input.
+        await admin_conn.execute(f'CREATE DATABASE "{test_db_name}"')
+    finally:
+        await admin_conn.close()
+
+    try:
+        monkeypatch.setenv("DATABASE_URL", test_db_url)
+
+        first_exit = await migrate.run()
+        assert first_exit == 0
+
+        conn = await asyncpg.connect(test_db_url)
+        try:
+            tables = {
+                row["tablename"]
+                for row in await conn.fetch(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                )
+            }
+        finally:
+            await conn.close()
+        expected_tables = {
+            "companies",
+            "contacts",
+            "leads",
+            "deals",
+            "events",
+            "jobs",
+            "schema_migrations",
+        }
+        assert expected_tables.issubset(tables)
+
+        second_exit = await migrate.run()
+        assert second_exit == 0
+    finally:
+        admin_conn = await asyncpg.connect(database_url)
+        try:
+            await admin_conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = $1 AND pid <> pg_backend_pid()",
+                test_db_name,
+            )
+            await admin_conn.execute(f'DROP DATABASE IF EXISTS "{test_db_name}"')
+        finally:
+            await admin_conn.close()
 
 
 async def test_no_transaction_migration_applies_and_is_recorded(

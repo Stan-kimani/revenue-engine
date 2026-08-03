@@ -226,7 +226,7 @@ result = await complete_json(
 
 ### 3.4 Shared memory
 - **Structured:** all entities in Postgres (§5). Any agent reads any table via repositories.
-- **Semantic:** an `embeddings` table (pgvector) storing chunks of: meeting transcripts, email threads, winning messaging, objection-response pairs, market research notes. `memory.semantic_search(query, kinds=[...], industry=...)` is the single retrieval interface. Sales drafting prompts receive "similar past wins" and "how we've handled this objection before" as retrieved context.
+- **Semantic:** an `embeddings` table (pgvector) storing chunks of: meeting transcripts, email threads, winning messaging, objection-response pairs, market research notes. `memory.semantic_search(query, kinds=[...], industry=..., scope=...)` is the single retrieval interface — `kind` is what the content *is*, `scope` (`global | industry | account`) is who it's retrievable for, and only `verified = true` chunks are ever retrieved for outreach (competitive-deltas.md D4; entity-model.md §7). Sales drafting prompts receive "similar past wins" and "how we've handled this objection before" as retrieved context.
 - **What is NOT memory:** agents do not maintain private conversational state. All state is rows.
 
 ---
