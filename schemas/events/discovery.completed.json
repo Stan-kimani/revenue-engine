@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "discovery.completed",
+  "description": "Result of one discovery run.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "found",
+    "deduped",
+    "kept",
+    "credits_used",
+    "run_id"
+  ],
+  "properties": {
+    "found": {
+      "type": "integer"
+    },
+    "deduped": {
+      "type": "integer"
+    },
+    "kept": {
+      "type": "integer"
+    },
+    "credits_used": {
+      "type": "integer"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "industry_pack": {
+      "type": "string"
+    }
+  }
+}

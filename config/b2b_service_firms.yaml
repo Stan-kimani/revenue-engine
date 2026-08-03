@@ -25,7 +25,7 @@ icp:
     employee_bands: ["11-50", "51-200"]        # primary
     employee_bands_secondary: ["1-10"]          # scored lower, not excluded
     revenue_signals: [growing, established]
-    geographies_preferred: [US, UK, CA, AU, AE, SG, KE, ZA, IN, PL, DE, FR, NL, SE, CH, IE]
+    geographies_preferred: [US, UK, CA, AU, AE, SG, KE, ZA]
 
   roles:
     target_titles:
@@ -70,11 +70,19 @@ icp:
 # Scoring
 # ---------------------------------------------------------------------------
 scoring:
-  weights:
-    icp_match: 0.35          # deterministic: firmographics + role
-    intent: 0.25             # LLM sub-score: buying_intent
-    engagement: 0.20         # deterministic: replies, clicks, meetings
-    size_fit: 0.20           # deterministic: employee band vs primary/secondary
+  weights:                   # MUST sum to 1.0 — asserted by the config loader at boot
+    icp_match: 0.30          # deterministic: firmographics + role
+    intent: 0.22             # LLM sub-score: buying_intent
+    engagement: 0.18         # deterministic: replies, clicks, meetings
+    size_fit: 0.15           # deterministic: employee band vs primary/secondary
+    budget_fit: 0.15         # deterministic: self-reported or inferred budget band (D1)
+  budget_fit_map:
+    "40k_plus": 1.0
+    "15k_40k": 0.85
+    "5k_15k": 0.5
+    "under_5k": 0.1
+    "unknown": 0.4           # neutral-ish. Most outbound leads never self-report;
+                             # penalising unknown would bias the scorer toward inbound.
   bands:
     sql: 78
     mql: 58
@@ -100,6 +108,20 @@ scoring:
 # These disqualifiers cannot be detected from enrichment data. They are checked by a
 # human on the discovery call. Failing any of them ends the pursuit regardless of score.
 qualification:
+  # D7 — four-dimension opportunity score. Answers "is there a workflow worth
+  # automating", which the fit scorer cannot. Scored by a human on the call, and
+  # reused as the assessment-tool questionnaire spine.
+  opportunity_score:
+    dimensions:
+      frequency:           "How often does this run? daily > weekly > monthly"
+      friction:            "How painful and manual is it today?"
+      error_exposure:      "What does a mistake cost?"
+      revenue_sensitivity: "Does it touch money, claims, compliance, or lead response?"
+    scale: 1-5
+    threshold_to_scope: 14      # of 20; below this, decline or defer
+    require_all_above: 2        # a near-zero on ANY dimension disqualifies the workflow.
+                                # The intersection is the point, not the total.
+
   discovery_checklist:
     - id: named_process_owner
       question: "Who owns this process today, by name?"
@@ -160,8 +182,14 @@ voice:
 # Commercial boundaries — passed to handle_objection and draft_proposal
 # ---------------------------------------------------------------------------
 commercial_boundaries:
+  # D10: publishing a typical range is qualification. Quoting a project is negotiation.
+  # The model may emit published_range ONLY as an exact string match against this config.
+  # Any paraphrase or other figure still trips V4 (pricing_present) and routes to approval.
+  published_range:
+    enabled: false                    # flip to true once the figure is decided
+    statement: "<SET BY HUMAN>"       # e.g. "Most builds land between X and Y."
   never_state_autonomously:
-    - any price, rate, or range
+    - any price, rate, or range other than the verbatim published_range.statement
     - any discount or percentage
     - contract terms, payment terms, or guarantees
     - delivery dates not present in the service catalogue
@@ -179,6 +207,7 @@ objections:
     need:       "We already handle this, or we don't see the problem."
     authority:  "Need to check with a partner, board, or client."
     competitor: "Already working with someone, or evaluating alternatives."
+    handoff:    "Who maintains this after you leave. Ownership, IP, lock-in, bus factor."
     other:      "Genuinely fits none of the above. Explain in reasoning."
 
 # ---------------------------------------------------------------------------
@@ -219,6 +248,16 @@ service_catalogue:
     outcome: "We own the automation layer; new workflows added as they surface."
     duration: "rolling monthly"
   pricing: HUMAN_SET_ONLY     # the model never sets or infers a price
+
+# ---------------------------------------------------------------------------
+# Discovery (see docs/discovery-addendum.md). Demand-driven, not scheduled.
+# ---------------------------------------------------------------------------
+discovery:
+  enabled: false               # deliberate act to turn on. Off until Phase 1 converts.
+  replenish_floor: 40          # trigger below this many active leads
+  replenish_ceiling: 80        # top up to this
+  max_per_run: 50
+  credit_budget_per_week: 500  # enforced in code BEFORE the vendor call
 
 channels:
   email: true

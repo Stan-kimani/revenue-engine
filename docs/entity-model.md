@@ -121,10 +121,15 @@ A single attempt to engage one contact under one campaign. **This is the unit of
 | campaign_id | uuid fk **nullable** | Null for inbound/manual leads. |
 | industry_pack | text not null | The config that scored this lead — pinned, never re-read. |
 | source | text not null | `webform, manual_import, discovery, referral, inbound_reply` |
-| status | enum | `new, enriching, enrich_failed, scored, qualified, engaged, meeting_booked, converted, disqualified, unsubscribed, dormant` |
+| status | enum | `new, deferred, enriching, enrich_failed, scored, qualified, engaged, meeting_booked, converted, disqualified, unsubscribed, dormant` |
 | band | enum nullable | `cold, warm, mql, sql` |
 | current_score | numeric(5,2) | Cache of latest `lead_scores.total`. |
 | deal_id | uuid fk nullable | Set when a deal is created. |
+| budget_band | enum nullable | `unknown, under_5k, 5k_15k, 15k_40k, 40k_plus` (D1) |
+| budget_source | enum nullable | `self_reported, inferred, discovery_call` (D1) |
+| problem_statement | text nullable | Free text, **required for inbound sources** — see CHECK below (D8) |
+| pain_category | enum nullable | `manual_data_entry, slow_followup, reporting_visibility, intake, reconciliation, other` (D8) |
+| team_size_band | enum nullable | `solo, 2_10, 11_50, 50_plus` (D8) |
 | first_touched_at / last_activity_at | timestamptz | |
 | created_at / updated_at / deleted_at | timestamptz | |
 
@@ -135,6 +140,22 @@ CREATE UNIQUE INDEX one_active_lead_per_contact
   WHERE status NOT IN ('converted','disqualified','unsubscribed','dormant')
     AND deleted_at IS NULL;
 ```
+
+**Conditional requirement on `problem_statement` (D8):** required for inbound leads
+only. A blanket NOT NULL would break outbound lead creation.
+```sql
+ALTER TABLE leads ADD CONSTRAINT problem_statement_required_for_inbound
+  CHECK (
+    source NOT IN ('webform','inbound_reply','referral')
+    OR problem_statement IS NOT NULL
+  );
+```
+
+**On `status = 'deferred'` (event catalog `lead.deferred`):** set when the company
+already has an active lead and the single-thread index blocks insert. `first_touched_at`
+stays null. A scheduled job re-evaluates deferred leads when the blocking lead resolves.
+The constraint violation must be caught and converted to the event — never surfaced as
+a raw `UniqueViolation`.
 
 **Why `industry_pack` is pinned per lead:** if the pack's weights change next month,
 old scores must remain interpretable. The Learning Agent compares like with like.
@@ -210,6 +231,12 @@ Split so a transcript can be re-analysed with a newer prompt without losing the 
 
 Category vocabulary lives in config, not in the model's head — otherwise the Learning
 Agent counts "pricing", "price", and "too expensive" as three different objections.
+
+**Closed set (8) — must be identical in the industry pack, `reply_classification.json`
+and `objection_response.json`:** `price, timing, trust, need, authority, competitor,
+handoff, other`. `handoff` (who maintains this after you leave — ownership, IP, lock-in,
+bus factor) is the dominant unspoken objection in this category; burying it under
+`trust` makes it invisible to the Learning Agent's objection-frequency analysis.
 
 ### 3.10 `activities`
 Unified timeline for the operator view. Append-only: id, entity_type, entity_id,

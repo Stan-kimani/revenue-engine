@@ -41,10 +41,11 @@
         "need",
         "authority",
         "competitor",
+        "handoff",
         "other",
         null
       ],
-      "description": "Closed vocabulary. null unless intent is objection."
+      "description": "Closed vocabulary, must match the industry pack objections block exactly. null unless intent is objection. 'handoff' = who maintains this after you leave (ownership, IP, lock-in, bus factor)."
     },
     "escalation_signals": {
       "type": "array",

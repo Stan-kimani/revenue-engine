@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "discovery.yield_low",
+  "description": "Survivors far below target \u2014 usually ICP filters too narrow or poor vendor coverage.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kept",
+    "expected",
+    "industry_pack"
+  ],
+  "properties": {
+    "kept": {
+      "type": "integer"
+    },
+    "expected": {
+      "type": "integer"
+    },
+    "industry_pack": {
+      "type": "string"
+    },
+    "filters_used": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "discovery.requested",
+  "description": "Emitted when active lead count falls below replenish_floor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "industry_pack",
+    "target_count",
+    "triggered_by"
+  ],
+  "properties": {
+    "industry_pack": {
+      "type": "string"
+    },
+    "target_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "triggered_by": {
+      "enum": [
+        "replenish_check",
+        "manual"
+      ]
+    }
+  }
+}

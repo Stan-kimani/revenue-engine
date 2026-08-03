@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "reply.unmatched",
+  "description": "Inbound reply could not be matched to a lead. Routes to human review \u2014 never auto-creates a lead.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message_id",
+    "from_email",
+    "attempted_matches"
+  ],
+  "properties": {
+    "message_id": {
+      "type": "string"
+    },
+    "from_email": {
+      "type": "string"
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "attempted_matches": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "thread_id",
+          "in_reply_to",
+          "contact_email"
+        ]
+      }
+    }
+  }
+}
