@@ -7,6 +7,7 @@ transaction, with the tracking row inserted in the same transaction.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -25,28 +26,30 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 async def run() -> int:
     load_dotenv()
-    import os
 
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         print("DATABASE_URL is not set.", file=sys.stderr)
         return 1
 
-    migrations = sorted(MIGRATIONS_DIR.glob("*.sql"))
-    if not migrations:
-        print("No migration files found in migrations/.")
-        return 0
+    try:
+        conn = await asyncpg.connect(database_url)
+    except Exception as exc:
+        print(f"Could not connect to DATABASE_URL: {exc}", file=sys.stderr)
+        return 1
 
-    conn = await asyncpg.connect(database_url)
     try:
         await conn.execute(CREATE_TRACKING_TABLE)
+
         applied = {
             row["filename"] for row in await conn.fetch("SELECT filename FROM schema_migrations")
         }
 
+        migrations = sorted(MIGRATIONS_DIR.glob("*.sql"))
         pending = [m for m in migrations if m.name not in applied]
+
         if not pending:
-            print("Nothing to apply. Database is up to date.")
+            print(f"up to date, {len(applied)} previously applied")
             return 0
 
         for migration in pending:
@@ -63,6 +66,7 @@ async def run() -> int:
                 return 1
             print(f"Applied {migration.name}")
 
+        print(f"{len(pending)} migrations applied")
         return 0
     finally:
         await conn.close()

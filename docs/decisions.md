@@ -142,3 +142,47 @@ wrapped differently).
 .env` first (README quickstart already documents this) — that step was never
 optional; the fix ensures the copied values actually work against
 `docker-compose.yml` rather than mismatching on password.
+
+## 2026-08-03 — M0.1 defect: migrate.py exited before ever opening a connection
+
+**Context:** on verification, `scripts/migrate.py` printed "No migration files
+found" and exited before connecting to Postgres. Two "successful" `make migrate`
+runs against a healthy database had created no `schema_migrations` table — the
+connection path, credentials, and tracking-table DDL were completely untested.
+The early return on an empty `migrations/` glob, added when the script was first
+written, was the bug: an empty `migrations/` directory is normal at this point in
+the build (M0.2 hasn't run) and must not skip the connection.
+
+**Decision:** reordered `run()` to always, in this order: (1) connect to
+`DATABASE_URL`, failing loudly with the underlying exception if unreachable,
+(2) `CREATE TABLE IF NOT EXISTS schema_migrations`, (3) scan `migrations/*.sql`
+and apply anything pending, (4) report either `"N migrations applied"` or
+`"up to date, N previously applied"`. No path through the function can now avoid
+opening a connection.
+
+**Verification:** since the sandbox's default `localhost:5432` was occupied by an
+unrelated, pre-existing container with a stale password baked into its volume
+(not something to touch or reuse), verification ran against a fully isolated,
+disposable Postgres on a scratch port: `scripts/migrate.py` run twice against an
+empty directory (creates the table, 0 rows, idempotent), then again against a
+directory with one real `.sql` file (applies it, creates its table, second run
+reports `1 previously applied` and creates nothing) — confirming both the fixed
+ordering and the untouched apply/idempotency logic actually work end to end
+against a real database, not just at the syntax level.
+
+**New test:** `tests/integration/test_migrate.py`, marked `integration`, asserts
+(a) running against an empty (monkeypatched) `migrations/` dir creates
+`schema_migrations`, and (b) running twice is idempotent. It loads
+`scripts/migrate.py` by file path via `importlib`, since scripts/ is intentionally
+not part of the installed `src/revenue_engine` package. Runs in CI now that the
+postgres service exists (previous decision above).
+
+**Judgment call flagged, not resolved:** `scripts/migrate.py` contains inline SQL
+(the `schema_migrations` DDL and its queries), which reads as a literal violation
+of CLAUDE.md rule 4 ("All SQL lives in `db/repositories.py`. No inline SQL in
+... scripts"). Treating it as migration-tooling infrastructure — the same
+category as `migrations/*.sql` itself, which the "Where things go" table
+explicitly exempts — rather than the domain SQL rule 4 targets, since
+`db/repositories.py` does not exist until M0.2 and the migration runner has to be
+connectable and testable before then. Revisit explicitly at M0.2 once
+`repositories.py` exists, rather than assumed settled by this note.
