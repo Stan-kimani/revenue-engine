@@ -2,7 +2,11 @@
 
 You are implementing the AI Revenue Engine. This file is the behavioural contract for
 working in this repo. The architectural source of truth is the design set in `docs/`:
-
+- **Never rename or relocate a file you were given.** Use the exact path and
+  filename specified. Documents, configs, prompts, and schemas use hyphens;
+  only Python modules use underscores. If a path seems wrong, ask — do not
+  normalise it.
+  
 | Document | Covers |
 |---|---|
 | `docs/revenue-engine-build-spec.md` | Phases, milestones, repo layout, integrations |
