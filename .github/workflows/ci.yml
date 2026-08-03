@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  POSTGRES_USER: revenue_engine
+  POSTGRES_PASSWORD: revenue_engine
+  POSTGRES_DB: revenue_engine
+  DATABASE_URL: postgresql://revenue_engine:revenue_engine@localhost:5432/revenue_engine
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: revenue_engine
+          POSTGRES_PASSWORD: revenue_engine
+          POSTGRES_DB: revenue_engine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U revenue_engine -d revenue_engine"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: mypy --strict (core, db)
+        run: uv run mypy --strict src/revenue_engine/core src/revenue_engine/db
+
+      - name: Apply migrations
+        run: uv run python scripts/migrate.py
+
+      - name: pytest (unit + contract + integration)
+        run: uv run pytest tests/unit tests/contracts tests/integration
