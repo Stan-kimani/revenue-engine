@@ -1,0 +1,12 @@
+# config/base.yaml
+# Global defaults: models, caps, schedules (build-spec §2). Only the queue.*
+# keys core/queue.py needs exist so far — core/config.py (M0.4) is what will
+# actually load, validate, and type this file; everything else in "models,
+# caps, schedules" waits for that milestone rather than being added
+# speculatively now.
+
+queue:
+  max_attempts: 5 # after this many attempts, a job dead-letters instead of retrying
+  backoff_base_s: 2 # full-jitter backoff: min(cap, base * 2^attempts) * uniform(0.5, 1.0)
+  backoff_cap_s: 300
+  visibility_timeout_s: 300 # a 'running' job whose lock is older than this is reclaimed

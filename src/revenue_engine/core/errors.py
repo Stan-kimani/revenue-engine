@@ -34,3 +34,24 @@ class InvalidAttributeEnvelopeError(RevenueEngineError):
         self.field = field
         self.errors = errors
         super().__init__(f"Invalid attribute envelope for '{field}': {'; '.join(errors)}")
+
+
+class UnknownEventTypeError(RevenueEngineError):
+    """Raised when core/events.py::emit() is asked to emit a type with no
+    schemas/events/<type>.json file. A typo in an event type must fail loudly,
+    not create a new type by accident (event-catalog.md §9.2)."""
+
+    def __init__(self, event_type: str) -> None:
+        self.event_type = event_type
+        super().__init__(f"Unknown event type '{event_type}': no schemas/events/{event_type}.json")
+
+
+class EventPayloadValidationError(RevenueEngineError):
+    """Raised when an event payload fails validation against its schema.
+    The event is never inserted (core/events.py::emit() validates before
+    calling repositories.emit_event)."""
+
+    def __init__(self, event_type: str, errors: list[str]) -> None:
+        self.event_type = event_type
+        self.errors = errors
+        super().__init__(f"Invalid payload for event '{event_type}': {'; '.join(errors)}")

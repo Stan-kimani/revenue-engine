@@ -54,5 +54,5 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["asyncpg", "jsonschema"]
+module = ["asyncpg", "jsonschema", "yaml"]
 ignore_missing_imports = true

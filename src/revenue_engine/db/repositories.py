@@ -12,7 +12,7 @@ codec is registered on a bare connection), so every jsonb read goes through
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -429,6 +429,37 @@ async def get_event(conn: asyncpg.Connection, event_id: UUID) -> Event | None:
     return _row_to_event(row) if row else None
 
 
+async def claim_unprocessed_event(conn: asyncpg.Connection) -> Event | None:
+    """Claim one unprocessed event via SELECT ... FOR UPDATE SKIP LOCKED,
+    oldest first. The row lock is held until the caller's transaction commits
+    — call this inside a transaction you control, and mark it processed
+    (`mark_event_processed`) in that same transaction (M0.3 correctness
+    requirement (a): an event must never be marked processed without its jobs
+    having been enqueued in the same commit — see core/queue.py and
+    docs/decisions.md for the full mechanism).
+
+    Ordering note: FOR UPDATE SKIP LOCKED does not guarantee strict
+    occurred_at order under concurrent claimers — a row skipped by one
+    claimer isn't re-offered to the next in order. M0.3 runs a single event
+    dispatcher (docs/decisions.md), so this doesn't matter in practice yet;
+    documented as a known scaling limit, not silently relied upon.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM events
+        WHERE processed_at IS NULL
+        ORDER BY occurred_at
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+        """
+    )
+    return _row_to_event(row) if row else None
+
+
+async def mark_event_processed(conn: asyncpg.Connection, event_id: UUID) -> None:
+    await conn.execute("UPDATE events SET processed_at = now() WHERE event_id = $1", event_id)
+
+
 # ============================================================================
 # Jobs (queue)
 # ============================================================================
@@ -460,27 +491,94 @@ async def get_job(conn: asyncpg.Connection, job_id: UUID) -> Job | None:
     return _row_to_job(row) if row else None
 
 
-async def claim_job(conn: asyncpg.Connection, *, worker_id: str) -> Job | None:
-    """Claim one pending, due job for `worker_id` via SELECT ... FOR UPDATE
-    SKIP LOCKED (build-spec §2). The row lock is held until the caller's
-    transaction commits — call this inside a transaction you control.
+async def get_job_by_source_event(
+    conn: asyncpg.Connection, *, job_type: str, source_event_id: UUID
+) -> Job | None:
+    """Backs core/queue.py::enqueue_for_event()'s dedup-on-(event_id, job_type)
+    upsert. `jobs` has no dedicated column for this — `source_event_id` is
+    read out of the jsonb `payload` (embedded there by enqueue_for_event).
     """
     row = await conn.fetchrow(
+        "SELECT * FROM jobs WHERE type = $1 AND (payload->>'source_event_id')::uuid = $2 LIMIT 1",
+        job_type,
+        source_event_id,
+    )
+    return _row_to_job(row) if row else None
+
+
+async def claim_jobs(conn: asyncpg.Connection, *, worker_id: str, limit: int) -> list[Job]:
+    """Claim up to `limit` pending, due jobs for `worker_id` via
+    SELECT ... FOR UPDATE SKIP LOCKED (build-spec §2). Ties on `run_after`
+    (the common case for jobs enqueued together in one transaction) are
+    broken by `created_at` so ordering is deterministic, not
+    insertion-order-by-accident. Reclaiming stale 'running' jobs is
+    deliberately NOT done here — see `reclaim_stale_jobs`.
+    """
+    rows = await conn.fetch(
         """
         UPDATE jobs
         SET status = 'running', locked_by = $1, locked_at = now(), updated_at = now()
-        WHERE id = (
+        WHERE id IN (
             SELECT id FROM jobs
             WHERE status = 'pending' AND run_after <= now()
-            ORDER BY run_after
+            ORDER BY run_after, created_at
             FOR UPDATE SKIP LOCKED
-            LIMIT 1
+            LIMIT $2
         )
         RETURNING *
         """,
         worker_id,
+        limit,
     )
-    return _row_to_job(row) if row else None
+    return [_row_to_job(row) for row in rows]
+
+
+async def claim_job(conn: asyncpg.Connection, *, worker_id: str) -> Job | None:
+    """Single-job convenience wrapper over `claim_jobs` (M0.2 call sites)."""
+    jobs = await claim_jobs(conn, worker_id=worker_id, limit=1)
+    return jobs[0] if jobs else None
+
+
+async def reclaim_stale_jobs(
+    conn: asyncpg.Connection, *, visibility_timeout_s: int, max_attempts: int
+) -> list[Job]:
+    """Sweep for 'running' jobs whose lock has outlived the visibility
+    timeout — a worker that died mid-job must not strand its work forever.
+
+    Deliberately a separate query from `claim_jobs`, not folded into it
+    (docs/decisions.md, Correction 2): combining "claim pending" and "reclaim
+    stale" in one query with a single `attempts` treatment either never
+    increments `attempts` for the reclaim case — letting a job whose worker
+    keeps dying be reclaimed forever and never dead-letter — or conflates two
+    operationally distinct events into one query that's harder to reason
+    about and test in isolation. This sweep increments `attempts` and decides
+    pending-vs-dead-letter in the same statement, so a repeatedly-crashing
+    job's job reaches `max_attempts` and stops being reclaimed.
+
+    Returns every reclaimed job, including ones that landed in
+    'dead_letter' — the caller (core/queue.py) is responsible for emitting
+    `job.dead_lettered` for those; this function only persists.
+    """
+    rows = await conn.fetch(
+        """
+        UPDATE jobs
+        SET status = CASE WHEN attempts + 1 >= $2 THEN 'dead_letter' ELSE 'pending' END,
+            attempts = attempts + 1,
+            locked_by = NULL,
+            locked_at = NULL,
+            updated_at = now(),
+            last_error = 'reclaimed: worker lock exceeded visibility timeout'
+        WHERE id IN (
+            SELECT id FROM jobs
+            WHERE status = 'running' AND locked_at < now() - $1::interval
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+        """,
+        timedelta(seconds=visibility_timeout_s),
+        max_attempts,
+    )
+    return [_row_to_job(row) for row in rows]
 
 
 async def complete_job(conn: asyncpg.Connection, job_id: UUID) -> Job:

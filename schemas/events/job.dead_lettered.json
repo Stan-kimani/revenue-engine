@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "job.dead_lettered",
+  "description": "A job exhausted its retry attempts. Emitted by core/queue.py::fail() when attempts reaches max_attempts. Operational event — consumed by the ops notifier, never by domain agents (event-catalog.md §7).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id",
+    "job_type",
+    "attempts",
+    "last_error"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "job_type": {
+      "type": "string"
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "last_error": {
+      "type": "string"
+    }
+  }
+}

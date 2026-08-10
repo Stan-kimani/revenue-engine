@@ -618,3 +618,222 @@ demonstrates a *correct raise*, not a business rule — the actual protected
 regression coverage for "contact already active → raise" already exists).
 `ruff check`, `ruff format --check`, and `mypy --strict` on `core/` and
 `db/` are clean.
+
+## 2026-08-10 — M0.3: core/events.py, core/queue.py, orchestrator/router.py, scripts/run_worker.py
+
+**Task 1 (separate from M0.3 itself):** CI was verified genuinely green by
+downloading the actual GitHub Actions job log for run #9 (commit `245326e`)
+via the repo's own push credential (read-only use, never printed), not by
+reasoning about the YAML. `DATABASE_URL` was populated (masking of
+`revenue_engine:revenue_engine@` in the log — GitHub auto-masks any text
+matching a declared env value — is itself proof it wasn't empty); the raw
+log shows `collected 55 items` / `55 passed in 3.76s`, `0 skipped`. The 37s
+total is accounted for by the step timings (15s of it is `Initialize
+containers` — the service health-check gate genuinely waiting — not
+anything suspicious). No changes made.
+
+### Correction 1 — single event dispatcher (not per-correlation-id ordering)
+
+Chosen, per the instruction's own lean: **(ii)**. `scripts/run_worker.py`
+elects exactly one event dispatcher across however many `run_worker.py`
+processes are running, via `pg_try_advisory_lock` on a fixed key held on a
+dedicated connection for the dispatch loop's lifetime. This is an *enforced*
+guarantee, not an operational promise ("please only run one instance") —
+deliberately, since the latter is exactly the kind of thing that becomes an
+emergent property the first time someone scales workers without reading the
+docs. Concurrency is where the job queue provides real parallelism instead
+(the protected concurrent-claim test proves that side).
+
+Documented as a known scaling limit in
+`repositories.claim_unprocessed_event`'s docstring and
+`scripts/run_worker.py`'s module docstring, not left implicit. Revisit with
+option (i) — serialize per `correlation_id`, allow cross-`correlation_id`
+concurrency — only if event-dispatch throughput actually becomes a
+bottleneck; nothing about the current design blocks adding that later.
+
+### Correction 2 — stale-job reclaim is a separate sweep, not folded into claim
+
+Chosen: **separate sweep** (`repositories.reclaim_stale_jobs`, called by
+`core/queue.py::reclaim_stale`, run periodically by `run_worker.py`'s own
+loop) — not a single query that both claims pending jobs and reclaims stale
+ones. Reasoning: a single query handling both cases needs a `CASE` expression
+to increment `attempts` only for the reclaim branch, which is *possible* but
+conflates two operationally distinct events (a healthy claim vs. a crash
+recovery) into one query that's harder to reason about, log, and test in
+isolation from each other. The separate sweep increments `attempts` and
+decides pending-vs-dead-letter in the same statement, so a job whose worker
+keeps dying reaches `max_attempts` and stops being silently reclaimed forever
+— verified directly by
+`test_stale_job_reclaimed_repeatedly_eventually_dead_letters`, which
+reclaims the same job `max_attempts` times in a loop and asserts it
+dead-letters on the last one, not before.
+
+### Correction 3 — tiebreaker
+
+`claim_jobs`' claim query is now `ORDER BY run_after, created_at` (was
+`ORDER BY run_after` alone). Trivial but real: jobs enqueued together in one
+transaction (the common case, via `enqueue_for_event`) share a `run_after`
+default of `now()`, so without the tiebreaker their relative order was
+whatever Postgres felt like on a given execution, not anything deterministic.
+
+### Correction 4 — temporary config loader
+
+`core/queue.py::QueueConfig` / `_load_config()` reads exactly the four
+`queue.*` keys from `config/base.yaml` directly (`yaml.safe_load`, no
+validation beyond dict access) — explicitly marked in both the class and
+function docstrings as **temporary**, to be replaced by `core/config.py`'s
+typed, validated loader at M0.4, and not to be extended for anything else in
+the meantime. `config/base.yaml` itself only gains the four `queue.*` keys
+this milestone needs — everything else build-spec §2 describes it eventually
+holding ("models, caps, schedules") waits for M0.4 rather than being added
+speculatively now.
+
+### Correctness requirements — mechanisms, stated explicitly
+
+**(a) Event-processed / jobs-enqueued atomicity.** One transaction, one
+connection: `scripts/run_worker.py::dispatch_one_event` wraps
+`claim_unprocessed_event` (`SELECT ... FOR UPDATE SKIP LOCKED`),
+`enqueue_for_event` for every `JobSpec` the router returns, and
+`mark_event_processed` in a single `async with conn.transaction():` block.
+Postgres commits all of it or none of it — there is no window where
+`processed_at` is set but a job doesn't exist, or a job exists but the event
+still shows as processed on a later, contradictory read. Proven, not just
+described: `test_event_never_marked_processed_unless_jobs_were_enqueued`
+raises inside that exact block, after the job insert and before
+`mark_event_processed`, and asserts both that the event is still unprocessed
+*and* that no orphan job exists after the rollback — the failure mode a
+mechanism that only got one of those two right would still pass a weaker
+test for. If the dispatch transaction is retried after a crash,
+`enqueue_for_event`'s dedup on `(event_id, job_type)` (an upsert — check
+first, insert only if absent) makes that retry safe against a *previous*
+aborted attempt at the same event, not just against genuinely new events.
+
+**(b) Handler idempotency.** Two distinct layers, not conflated: (1) a job
+can never be held by two workers at once — `SELECT ... FOR UPDATE SKIP
+LOCKED`, proven with two real concurrent connections, not a mock
+(`test_two_concurrent_workers_never_claim_the_same_job`); (2) a job *can* be
+claimed, partially run, and then reclaimed and re-run from the start after a
+crash (that's what the visibility-timeout reclaim is for) — core/queue.py
+does not and cannot make an individual handler's body idempotent. That's the
+handler's job: upsert on a natural key, `emit()` with a deterministic
+`idempotency_key`, never a blind `INSERT` — exactly the discipline every
+M0.2 repository function already follows. Stated in `core/queue.py`'s module
+docstring, not left as an implied guarantee the queue doesn't actually
+provide.
+
+**(c) Poison jobs don't block the queue.** A claimed job with no registered
+handler (all of them, in M0.3 — no agents exist) or whose handler raises
+fails cleanly through `core/queue.py::fail()` (bounded retries, eventual
+dead-letter) rather than crashing the worker process or the batch it's part
+of. `run_job_loop` processes a claimed batch via `asyncio.gather`, so one
+job's exception doesn't prevent the others in the same batch from
+completing — proven by `test_poison_job_does_not_block_other_jobs`, which
+processes an always-poison job immediately before a healthy one and asserts
+the healthy one still reaches `completed`.
+
+**(d) Backoff is bounded and jittered.** `min(cap, base * 2^attempts) *
+uniform(0.5, 1.0)` — full jitter, `base=2s`, `cap=300s`, `max_attempts=5`
+(confirmed values, unchanged). Bounded so a job that's failed many times
+doesn't end up scheduled a day out; jittered so many jobs failing at the same
+moment (a downstream outage) don't all retry in lockstep the instant it
+recovers.
+
+### Job-enqueue idempotency key, without a schema change
+
+The confirmed "deterministic job idempotency key from (event_id, job_type),
+upsert not insert" has no column to lean on — `jobs` has no
+`idempotency_key`-style column, and no migration was in scope this round
+("no new tables" was confirmed; no new columns were asked for either).
+Implemented instead as an application-level check-then-insert
+(`repositories.get_job_by_source_event`, querying
+`payload->>'source_event_id'`) — genuinely safe *because* Correction 1 makes
+event dispatch single-process: there is exactly one place in the whole system
+that ever calls `enqueue_for_event`, so there is no concurrent
+check-then-insert race to protect against. If event dispatch ever becomes
+concurrent (revisiting Correction 1), this dedup mechanism would need
+revisiting into a real DB constraint at the same time — noted here so that
+future change doesn't silently reintroduce a duplicate-job race. The job's
+payload also carries the source event's `correlation_id`, not just its id —
+otherwise a job that dead-letters days after its originating event would have
+no way to be traced back to the lead it belongs to.
+
+### Two additional, smaller judgment calls
+
+- **`meeting.requested` routes to `sales.book_meeting`.** event-catalog.md's
+  own section header for this event says "Emitted by Sales," but
+  agent-contracts.md §3 explicitly lists `meeting.requested` as a Sales
+  *consume* trigger. The two docs disagree with each other; followed the
+  more specific per-agent contract (agent-contracts.md) rather than guessing
+  which one is stale.
+- **ROUTES / UNCONSUMED scope.** Routed only events with a documented
+  Phase-1-**agent** consumer (leadgen, qualification, sales —
+  agent-contracts.md's own phase labels), even where the event itself is
+  Phase 1 (e.g. `deal.created`, `reply.classified`, `contact.unsubscribed`,
+  `outreach.sent` — all Phase 1 events, but their sole consumer is CRM Sync,
+  which agent-contracts.md itself labels "Phase 2"). Consumers behind
+  infrastructure not in M0.3's scope (Slack/ops notifier — M1.3;
+  `orchestrator/sequences.py` and `orchestrator/schedules.py` — not part of
+  this milestone) are UNCONSUMED for the same reason, even for events
+  agent-contracts.md's own illustrative router example showed routed
+  (`lead.routed_to_human` -> `notify.slack`) — that example describes the
+  system's eventual full state, not what M0.3 specifically builds.
+
+### Bug found by actually running this against Postgres
+
+`repositories.reclaim_stale_jobs`'s query compared `locked_at < now() - $1`
+with `$1` bound to a Python `timedelta`. Without an explicit cast, Postgres's
+parameter-type inference resolved `$1` as `timestamptz` (not `interval`),
+making `now() - $1` evaluate to type `interval` and the outer comparison
+`timestamptz < interval` — `asyncpg.exceptions.UndefinedFunctionError:
+operator does not exist: timestamp with time zone < interval`. Neither
+`ruff` nor `mypy --strict` has any way to catch a Postgres type-inference
+ambiguity — it only showed up running the reclaim tests against real
+Postgres. Fixed with an explicit `$1::interval` cast.
+
+### ROUTES/UNCONSUMED coverage verified against the live document, not by hand-count
+
+`tests/contracts/test_router_coverage.py` extracts every backtick-quoted,
+dotted token from `docs/event-catalog.md` directly (with `{a|b}` brace
+expansion for headings like `` `lead.qualified.{cold|warm|mql|sql}` ``),
+rather than hand-copying a list into the test. Run once, by hand, against the
+live file before writing `ROUTES`/`UNCONSUMED`, to build the table correctly
+in the first place rather than iterating against a failing test — 51 tokens
+extracted, 3 excluded by name because they aren't event types
+(`send.email` — R1's own explicit negative example of what not to name an
+event; `approvals.expiry` — a `config/thresholds.yaml` key path;
+`events.idempotency_key` — a column reference), leaving 48 real event types,
+all 48 already covered by the tables built from the per-agent contracts.
+§8's emitter/consumer matrix was deliberately not parsed — it uses no
+backticks around event names and introduces no event not already covered by
+a `###` heading or the §7 operational-events table, so parsing it would add
+extraction risk (a different format to get subtly wrong) for zero coverage
+gain.
+
+### Verification
+
+Migration unaffected (still 23 tables, 29 FKs) — this milestone touches only
+application code, `config/base.yaml`, and two new event schema files
+(`lead.captured.json`, `job.dead_lettered.json` — needed because
+`core/events.py::emit()` refuses unknown types, and M0.3's own tests and
+`core/queue.py`'s dead-letter path need to emit real, schema-backed events;
+the other ~28 documented event types remain unschema'd since nothing needs to
+emit them until the agents that would are built). All 78 tests (`tests/unit`
++ `tests/contracts` + `tests/integration`) pass against a real, disposable
+Postgres instance, including all 4 newly-required protected tests plus one
+added complementary positive-case test
+(`test_event_marked_processed_only_after_jobs_committed_together`) marked
+protected alongside the required crash-simulation test — 15 protected tests
+total now, confirmed via `pytest -m protected --collect-only`. The concurrent
+double-claim test was run 3 additional times in isolation to check for
+flakiness (none observed). `scripts/run_worker.py` was also smoke-tested as
+an actual running process (not just via its functions imported into tests):
+starts cleanly, logs structured JSON, acquires the advisory lock, and leaves
+no stuck `pg_advisory_lock` behind after being killed. `ruff check`, `ruff
+format --check`, and `mypy --strict` on `core/` and `db/` are clean.
+
+**Not verified:** signal-based graceful shutdown (SIGTERM specifically) was
+exercised via Python's standard `asyncio` pattern
+(`loop.add_signal_handler`, with a `signal.signal` fallback for event loops
+that don't support it) but not observed end-to-end sending a real SIGTERM to
+a running process in this Windows dev sandbox, where POSIX signal semantics
+differ from the Linux production target (build-spec §7).
