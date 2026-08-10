@@ -2,13 +2,18 @@
 
 scripts/migrate.py is not part of the src/ package, so it is loaded directly by
 file path rather than imported as a module.
+
+Every test here that needs to observe schema-from-scratch behaviour (creating
+schema_migrations for the first time) uses the disposable_database_url
+fixture (tests/integration/conftest.py) — a throwaway database, never
+TEST_DATABASE_URL itself. TEST_DATABASE_URL's own schema_migrations table is
+never dropped by this file — see docs/decisions.md for why that used to
+happen and what it corrupted.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import os
-import uuid
 from pathlib import Path
 from types import ModuleType
 
@@ -31,34 +36,16 @@ def _load_migrate_module() -> ModuleType:
 migrate = _load_migrate_module()
 
 
-@pytest.fixture
-def database_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        pytest.skip("DATABASE_URL is not set (checked .env and the shell environment)")
-    return url
-
-
-@pytest.fixture
-async def clean_schema_migrations(database_url: str):
-    conn = await asyncpg.connect(database_url)
-    try:
-        await conn.execute("DROP TABLE IF EXISTS schema_migrations")
-        yield
-    finally:
-        await conn.execute("DROP TABLE IF EXISTS schema_migrations")
-        await conn.close()
-
-
 async def test_empty_migrations_dir_creates_schema_migrations_table(
-    tmp_path, monkeypatch, database_url, clean_schema_migrations
+    tmp_path, monkeypatch, disposable_database_url
 ):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
+    monkeypatch.setenv("DATABASE_URL", disposable_database_url)
 
     exit_code = await migrate.run()
     assert exit_code == 0
 
-    conn = await asyncpg.connect(database_url)
+    conn = await asyncpg.connect(disposable_database_url)
     try:
         exists = await conn.fetchval(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
@@ -72,10 +59,9 @@ async def test_empty_migrations_dir_creates_schema_migrations_table(
         await conn.close()
 
 
-async def test_running_twice_is_idempotent(
-    tmp_path, monkeypatch, database_url, clean_schema_migrations
-):
+async def test_running_twice_is_idempotent(tmp_path, monkeypatch, disposable_database_url):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
+    monkeypatch.setenv("DATABASE_URL", disposable_database_url)
 
     first_exit = await migrate.run()
     second_exit = await migrate.run()
@@ -83,7 +69,7 @@ async def test_running_twice_is_idempotent(
     assert first_exit == 0
     assert second_exit == 0
 
-    conn = await asyncpg.connect(database_url)
+    conn = await asyncpg.connect(disposable_database_url)
     try:
         row_count = await conn.fetchval("SELECT count(*) FROM schema_migrations")
         assert row_count == 0
@@ -93,72 +79,46 @@ async def test_running_twice_is_idempotent(
 
 @pytest.mark.protected
 async def test_migration_0001_applies_cleanly_and_is_idempotent_on_empty_database(
-    database_url: str, monkeypatch
+    disposable_database_url: str, monkeypatch
 ):
     """Applies the REAL migrations/0001_init.sql (MIGRATIONS_DIR unpatched)
-    against a genuinely empty, disposable database — not the shared test
-    database other tests in this suite reuse, and not a monkeypatched empty
-    directory like the tests above. A fresh CREATE DATABASE within the same
-    Postgres instance is the isolation boundary.
+    against a genuinely empty, disposable database.
     """
-    base_url, _, _ = database_url.rpartition("/")
-    test_db_name = f"test_m0001_{uuid.uuid4().hex[:12]}"
-    test_db_url = f"{base_url}/{test_db_name}"
+    monkeypatch.setenv("DATABASE_URL", disposable_database_url)
 
-    admin_conn = await asyncpg.connect(database_url)
+    first_exit = await migrate.run()
+    assert first_exit == 0
+
+    conn = await asyncpg.connect(disposable_database_url)
     try:
-        # Identifier, not a value — cannot be parameterised. Safe: machine-generated
-        # uuid suffix, never user input.
-        await admin_conn.execute(f'CREATE DATABASE "{test_db_name}"')
-    finally:
-        await admin_conn.close()
-
-    try:
-        monkeypatch.setenv("DATABASE_URL", test_db_url)
-
-        first_exit = await migrate.run()
-        assert first_exit == 0
-
-        conn = await asyncpg.connect(test_db_url)
-        try:
-            tables = {
-                row["tablename"]
-                for row in await conn.fetch(
-                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-                )
-            }
-        finally:
-            await conn.close()
-        expected_tables = {
-            "companies",
-            "contacts",
-            "leads",
-            "deals",
-            "events",
-            "jobs",
-            "schema_migrations",
-        }
-        assert expected_tables.issubset(tables)
-
-        second_exit = await migrate.run()
-        assert second_exit == 0
-    finally:
-        admin_conn = await asyncpg.connect(database_url)
-        try:
-            await admin_conn.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = $1 AND pid <> pg_backend_pid()",
-                test_db_name,
+        tables = {
+            row["tablename"]
+            for row in await conn.fetch(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
             )
-            await admin_conn.execute(f'DROP DATABASE IF EXISTS "{test_db_name}"')
-        finally:
-            await admin_conn.close()
+        }
+    finally:
+        await conn.close()
+    expected_tables = {
+        "companies",
+        "contacts",
+        "leads",
+        "deals",
+        "events",
+        "jobs",
+        "schema_migrations",
+    }
+    assert expected_tables.issubset(tables)
+
+    second_exit = await migrate.run()
+    assert second_exit == 0
 
 
 async def test_no_transaction_migration_applies_and_is_recorded(
-    tmp_path, monkeypatch, database_url, clean_schema_migrations
+    tmp_path, monkeypatch, disposable_database_url
 ):
     monkeypatch.setattr(migrate, "MIGRATIONS_DIR", tmp_path)
+    monkeypatch.setenv("DATABASE_URL", disposable_database_url)
 
     migration_file = tmp_path / "0001_no_transaction.sql"
     migration_file.write_text(
@@ -166,34 +126,21 @@ async def test_no_transaction_migration_applies_and_is_recorded(
         "CREATE TABLE no_transaction_smoke_test (id serial primary key);\n"
     )
 
-    conn = await asyncpg.connect(database_url)
+    exit_code = await migrate.run()
+    assert exit_code == 0
+
+    conn = await asyncpg.connect(disposable_database_url)
     try:
-        await conn.execute("DROP TABLE IF EXISTS no_transaction_smoke_test")
+        recorded = await conn.fetchval(
+            "SELECT count(*) FROM schema_migrations WHERE filename = $1",
+            "0001_no_transaction.sql",
+        )
+        assert recorded == 1
+
+        table_exists = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_name = 'no_transaction_smoke_test')"
+        )
+        assert table_exists is True
     finally:
         await conn.close()
-
-    try:
-        exit_code = await migrate.run()
-        assert exit_code == 0
-
-        conn = await asyncpg.connect(database_url)
-        try:
-            recorded = await conn.fetchval(
-                "SELECT count(*) FROM schema_migrations WHERE filename = $1",
-                "0001_no_transaction.sql",
-            )
-            assert recorded == 1
-
-            table_exists = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-                "WHERE table_name = 'no_transaction_smoke_test')"
-            )
-            assert table_exists is True
-        finally:
-            await conn.close()
-    finally:
-        conn = await asyncpg.connect(database_url)
-        try:
-            await conn.execute("DROP TABLE IF EXISTS no_transaction_smoke_test")
-        finally:
-            await conn.close()

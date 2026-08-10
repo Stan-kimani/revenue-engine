@@ -31,6 +31,7 @@ and deletes are enforced in code, not prompts.
 | [`docs/discovery-addendum.md`](docs/discovery-addendum.md) | Prospect discovery design |
 | [`docs/competitive-deltas.md`](docs/competitive-deltas.md) | Competitive research → concrete build deltas |
 | [`docs/decisions.md`](docs/decisions.md) | Append-only decision log |
+| [`docs/verification-loop.md`](docs/verification-loop.md) | The verification checklist and report format every milestone follows |
 | [`docs/architecture.md`](docs/architecture.md) | Diagrams + data flow *(populated as agents land)* |
 | [`docs/deliverability.md`](docs/deliverability.md) | Email warmup, caps, domain strategy *(populated in M1.4)* |
 | [`docs/runbook.md`](docs/runbook.md) | Ops: deploy, rotate keys, recover from failures *(populated pre-launch)* |
@@ -43,7 +44,7 @@ Requires [`uv`](https://docs.astral.sh/uv/) and Docker.
 cp .env.example .env        # fill in ANTHROPIC_API_KEY, DEV_SANDBOX_EMAIL at minimum
 make setup                  # uv sync
 make dev                    # docker compose up — Postgres 16 + pgvector
-make migrate                # apply migrations/*.sql, tracked in schema_migrations
+make migrate                # apply migrations/*.sql to DATABASE_URL, tracked in schema_migrations
 make worker                 # start queue workers
 ```
 
@@ -55,8 +56,16 @@ make golden  # golden tests — calls a real LLM, costs money
 make check   # ruff + mypy --strict (core/, db/)
 ```
 
+**`make test` runs against `TEST_DATABASE_URL`, never `DATABASE_URL`.** They
+must be two different databases on the same Postgres server (`.env.example`
+sets `TEST_DATABASE_URL` to `..._test` by default) — the suite refuses to run
+if they're unset or identical, since integration test fixtures are allowed to
+do things to their database that would corrupt whatever `DATABASE_URL` points
+at (see `docs/runbook.md`). `TEST_DATABASE_URL`'s database is created and
+migrated automatically on first test run; no separate setup step needed.
+
 ## Status
 
-Phase 0 skeleton, milestone M0.2 (`migrations/0001_init.sql`, `db/models.py`,
-`db/repositories.py` for companies/contacts/leads/events/jobs). No agent or
-orchestrator code exists yet — see build-spec §10 for the full milestone order.
+Phase 0 skeleton, milestone M0.3 (`core/events.py`, `core/queue.py`,
+`orchestrator/router.py`, `scripts/run_worker.py`). No agent code exists yet
+— see build-spec §10 for the full milestone order.

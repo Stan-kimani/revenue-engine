@@ -10,6 +10,7 @@ env:
   POSTGRES_PASSWORD: revenue_engine
   POSTGRES_DB: revenue_engine
   DATABASE_URL: postgresql://revenue_engine:revenue_engine@localhost:5432/revenue_engine
+  TEST_DATABASE_URL: postgresql://revenue_engine:revenue_engine@localhost:5432/revenue_engine_test
 
 jobs:
   test:
@@ -35,7 +36,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v3
         with:
-          python-version: "3.12"
+          python-version-file: ".python-version"
 
       - name: Install dependencies
         run: uv sync

@@ -7,7 +7,6 @@ instruction and must not be weakened to make them pass.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import asyncpg
 import pytest
@@ -18,13 +17,8 @@ from revenue_engine.db.models import JobStatus
 
 pytestmark = pytest.mark.integration
 
-
-@pytest.fixture
-def database_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        pytest.skip("DATABASE_URL is not set (checked .env and the shell environment)")
-    return url
+# database_url fixture comes from tests/integration/conftest.py (TEST_DATABASE_URL,
+# never DATABASE_URL — see docs/decisions.md).
 
 
 @pytest.fixture

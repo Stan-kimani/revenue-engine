@@ -837,3 +837,121 @@ exercised via Python's standard `asyncio` pattern
 that don't support it) but not observed end-to-end sending a real SIGTERM to
 a running process in this Windows dev sandbox, where POSIX signal semantics
 differ from the Linux production target (build-spec §7).
+
+## 2026-08-10 — Defect: test suite corrupted a developer's dev database
+
+**Reproduced first, exactly.** Before writing any fix, stood up a persistent
+("dev-like") Postgres instance, applied migrations, ran the M0.3 test suite
+against it as `DATABASE_URL`, and confirmed both halves of the report:
+`78 passed`, then `psql -c "SELECT * FROM schema_migrations"` →
+`ERROR: relation "schema_migrations" does not exist`; running `scripts/migrate.py`
+again against the same database then failed with `relation "companies"
+already exists`, trying to re-apply `0001_init.sql` onto a schema whose
+tracking table was gone but whose data tables weren't. Root cause confirmed
+exactly as diagnosed: `tests/integration/test_migrate.py`'s
+`clean_schema_migrations` fixture ran `DROP TABLE IF EXISTS
+schema_migrations` before *and* after three tests, against whatever
+`DATABASE_URL` pointed at — which in this project's own dev/CI setup, until
+now, was the only database anything ran against.
+
+**Choice: (b), a separate `TEST_DATABASE_URL`.** Per the instruction's own
+lean, and because it's the more airtight guarantee for the actual amount of
+work involved: (a) would require every existing fixture across five test
+files to create-and-drop a per-test database, a much larger change for
+marginally more isolation than a single, permanent, distinct test database
+provides. (b) makes the separation a visible, named fact in `.env.example`
+and `docs/runbook.md` — a developer reading either file sees that
+`TEST_DATABASE_URL` exists and why — rather than something implicit in
+fixture behaviour that only becomes visible by reading test code.
+
+**Enforcement, not convention.** `tests/_db_safety.py::resolve_test_database_url()`
+is pure (no I/O), called from `tests/integration/conftest.py` at **module
+import time** — i.e. the instant pytest starts collecting anything under
+`tests/integration/`, before any fixture or test body runs — and aborts the
+*entire session* via `pytest.exit()`, not a per-test skip, if
+`TEST_DATABASE_URL` is unset or identical to `DATABASE_URL`. Both conditions
+refuse, not just the second: a missing `TEST_DATABASE_URL` is exactly as
+unsafe as a duplicated one, since either way tests would fall back to
+`DATABASE_URL`. Verified directly, twice, against the same dev-like database
+used for reproduction: removing `TEST_DATABASE_URL` from `.env` entirely (not
+just unsetting it at the shell — `tests/conftest.py`'s own `load_dotenv()`
+would silently restore it from `.env` otherwise) produces a clear refusal
+before any database connection is attempted; setting it equal to
+`DATABASE_URL` does the same. `schema_migrations`' `applied_at` timestamp was
+identical before and after every verification run in this session, confirmed
+by direct comparison, not inference.
+
+**No manual setup step, and no changes to `docker-compose.yml` or
+`Makefile`.** `tests/integration/conftest.py` creates `TEST_DATABASE_URL`'s
+target database automatically (via `DATABASE_URL`'s own connection, which
+already has `CREATEDB` — confirmed in the 2026-08-03 M0.2 entry above) if it
+doesn't exist, and applies migrations to it by loading and calling
+`scripts/migrate.py`'s own `run()` function — reusing the single canonical
+migration-application path rather than duplicating its logic — the first
+time any integration test is collected. `make migrate` is unchanged and
+still targets `DATABASE_URL` only.
+
+**`test_migrate.py`'s three affected tests were rewritten**, not patched, to
+use a new `disposable_database_url` fixture (`tests/integration/conftest.py`)
+— a fresh, uniquely-named, `CREATE DATABASE`-per-test database, the same
+proven pattern the existing `test_migration_0001_applies_cleanly_...` test
+already used — instead of sharing and destructively resetting
+`TEST_DATABASE_URL`'s own tracking table. None of the five integration test
+files' local `database_url` fixtures survive; all now come from the shared
+`tests/integration/conftest.py` fixture, which is also what fixed the
+duplication of that exact fixture across five files.
+
+**New protected tests (18 total now, confirmed via `pytest -m protected
+--collect-only`):**
+- `test_schema_migrations_survives_the_full_suite`
+  (`tests/integration/test_zz_suite_integrity.py`) — named with a `zz`
+  prefix specifically so it collects and runs *last* under pytest's default
+  (deterministic, alphabetical) collection order, since its entire point is
+  checking the state the whole suite left `schema_migrations` in.
+- `test_refuses_when_test_database_url_is_unset` and
+  `test_refuses_when_test_database_url_equals_database_url`
+  (`tests/unit/test_db_safety.py`) — unit tests (no I/O) against the actual
+  `resolve_test_database_url()` function `conftest.py` calls, not a proxy
+  for it. Kept in `tests/unit/` rather than `tests/integration/` since the
+  function itself never touches a database — only what calls it does.
+
+### `docs/verification-loop.md` — created, not just referenced
+
+This file was referenced by section number (§3, §7) across three consecutive
+milestones without ever existing in the repository — flagged each time, but
+never actually written. Created now: §3 (the standard command set) gains the
+post-suite database integrity check this instruction specifies, run *after*
+the suite, not before; §7 (the report format) gains the explicit
+"disposable" vs. "safe for a developer's environment" distinction that this
+whole defect was about not stating clearly enough. Both additions are
+described in the file itself, not just applied to reports going forward.
+Logged here rather than silently treated as though it always existed.
+
+### Minor: `.github/workflows/ci.yml`'s Python-version duplication
+
+The instruction described `ci.yml` pinning `python-version: "3.12"`
+literally. On inspection, the file actually had `python-version-file:
+"pyproject.toml"` — a different duplication than described (deriving from
+`requires-python` rather than a literal string), but still two sources for
+one fact, since `.python-version` exists specifically to be that single
+source (2026-08-03 entry above: "so `uv` selects a matching interpreter
+automatically"). Changed to `python-version-file: ".python-version"` —
+`.python-version` is now the one place this project's Python version is
+declared as a fact; `pyproject.toml`'s `requires-python` remains a *range*
+(`>=3.12,<3.13`), a different and compatible statement, not a duplicate of
+the exact version.
+
+### Verification
+
+Reproduced the exact reported defect first (both halves: the drop, and the
+cascading `relation "companies" already exists` on the next `migrate.py`
+run) against a real, persistent Postgres instance standing in for a
+developer's dev database — not inferred from reading the fixture. Applied
+the fix, then re-verified against the *same* database (reset once, cleanly,
+between the reproduction and the fix): full suite (`83 passed`), `ruff
+check`, `ruff format --check`, and `mypy --strict` on `core/`/`db/` all
+clean, `schema_migrations`'s `applied_at` timestamp byte-identical before and
+after, both refusal scenarios (unset / equal) confirmed to abort the session
+before any connection is attempted, and `revenue_engine_test` confirmed
+created automatically by `\l`. `pytest -m protected --collect-only` shows 18
+protected tests.
