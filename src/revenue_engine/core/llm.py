@@ -1,13 +1,22 @@
 """The only way anything calls a model (CLAUDE.md §1 non-negotiable 2).
 
 `complete_json()`: reads a prompt file, renders its `{{variables}}`, resolves
-its tier to a model via core/config.py, calls the model, validates the
-response against a JSON Schema plus the V1-V9 cross-field checks
-(docs/phase1-llm-boundary.md §4), retries once on any failure feeding the
-error back into the request, and on a second failure raises
-`LLMValidationError` and emits `llm.validation_failed` with nothing partial
-written. Every call — success or failure — is recorded to `agent_runs` and
-traced through core/observability.py.
+its tier to a model via core/config.py, calls the model with the output
+schema passed through the Anthropic API's native structured-output mechanism
+(`output_config.format` — constrained generation, not just a request phrased
+nicely), validates the response against that JSON Schema plus the V1-V9
+cross-field checks (docs/phase1-llm-boundary.md §4), retries once on any
+failure feeding both the error *and* the schema back into the request, and on
+a second failure raises `LLMValidationError` and emits `llm.validation_failed`
+with nothing partial written. Every call — success or failure — is recorded
+to `agent_runs` and traced through core/observability.py.
+
+Structured outputs (docs/decisions.md, 2026-08-13 entry): the model is never
+shown only prose describing the schema — it is constrained to it directly, so
+the class of bug where a model invents a plausible-but-wrong enum value or
+field name is prevented at generation time, not just caught after the fact.
+`schemas/outputs/*.json` remains the single source of truth; prompt bodies
+must never duplicate the schema in prose (prompts/_conventions.md).
 
 No prompt text lives here (CLAUDE.md §1 non-negotiable 3) — this module only
 parses and renders prompt *files*; the words themselves are all under
@@ -191,11 +200,70 @@ def _strip_code_fence(text: str) -> str:
 
 
 @cache
-def _load_output_validator(output_schema: str) -> jsonschema.Draft202012Validator:
+def _load_output_schema(output_schema: str) -> dict[str, Any]:
     path = _SCHEMAS_DIR / output_schema
     if not path.is_file():
         raise RevenueEngineError(f"Unknown output schema: {output_schema} (no {path})")
-    return jsonschema.Draft202012Validator(json.loads(path.read_text()))
+    schema = json.loads(path.read_text())
+    if not isinstance(schema, dict):
+        raise RevenueEngineError(f"{path}: expected a JSON object at the top level")
+    return schema
+
+
+@cache
+def _load_output_validator(output_schema: str) -> jsonschema.Draft202012Validator:
+    return jsonschema.Draft202012Validator(_load_output_schema(output_schema))
+
+
+def _to_structured_output_schema(node: Any) -> Any:
+    """Transform for the Anthropic structured-output API
+    (`output_config.format.schema`, https://platform.claude.com/docs/en/
+    build-with-claude/structured-outputs, verified 2026-08-13). Only one
+    transform is applied: a JSON Schema `enum` that includes `null` is
+    explicitly unsupported there ("use anyOf with {"type": "null"} instead")
+    and several of schemas/outputs/*.json use exactly that pattern for
+    inferred-value fields (e.g. company_enrichment.json's `business_model`,
+    contact_enrichment.json's `seniority`, reply_classification.json's
+    `objection_category`). Every other unsupported keyword (minLength,
+    maxLength, minimum, maximum, ...) is silently stripped by the installed
+    Anthropic SDK itself before the request is sent — not re-implemented
+    here, since duplicating that logic would drift from the SDK's own
+    behaviour. `schemas/outputs/*.json` is untouched by this function; it is
+    still what `_validate_json_response` checks the response against — this
+    transform only affects what the model is constrained to while
+    generating, never what this module accepts afterward.
+    """
+    if isinstance(node, dict):
+        result: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "enum" and isinstance(value, list) and None in value:
+                result["anyOf"] = [
+                    {"enum": [v for v in value if v is not None]},
+                    {"type": "null"},
+                ]
+            else:
+                result[key] = _to_structured_output_schema(value)
+        return result
+    if isinstance(node, list):
+        return [_to_structured_output_schema(item) for item in node]
+    return node
+
+
+@cache
+def _load_output_config(output_schema: str) -> dict[str, Any]:
+    """The full `output_config` request parameter for one output schema —
+    `{"format": {"type": "json_schema", "schema": ...}}`, per
+    OutputConfigParam/JSONOutputFormatParam in the installed `anthropic` SDK
+    (introspected via `inspect`, not assumed — see docs/decisions.md,
+    2026-08-13). Cached like every other schemas/prompts/ read in this
+    module, since the transform is pure and the schema files don't change at
+    runtime."""
+    return {
+        "format": {
+            "type": "json_schema",
+            "schema": _to_structured_output_schema(_load_output_schema(output_schema)),
+        }
+    }
 
 
 def _validate_json_response(
@@ -492,7 +560,9 @@ async def complete_json(
     model = config.model_for(resolved_tier)
     rendered_body = _render(template.body, variables, template.id)
     resolved_client = client if client is not None else _default_anthropic_client()
+    raw_schema = _load_output_schema(output_schema)
     validator = _load_output_validator(output_schema)
+    output_config = _load_output_config(output_schema)
 
     messages: list[dict[str, str]] = [{"role": "user", "content": rendered_body}]
 
@@ -509,6 +579,7 @@ async def complete_json(
             model=model,
             max_tokens=template.max_tokens,
             messages=messages,
+            output_config=output_config,
         )
         raw_text = _extract_text(response)
         in_tok, out_tok = _extract_usage(response)
@@ -533,6 +604,10 @@ async def complete_json(
                     "content": (
                         "Your previous response failed validation:\n"
                         + "\n".join(f"- {e}" for e in errors)
+                        + "\n\nThe response must match this JSON Schema exactly — field "
+                        "names and enum values must match precisely, never an invented "
+                        "alternative:\n"
+                        + json.dumps(raw_schema, indent=2)
                         + "\n\nReturn corrected JSON matching the schema. No prose outside JSON."
                     ),
                 }

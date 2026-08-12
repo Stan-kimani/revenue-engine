@@ -71,6 +71,91 @@ def test_strip_code_fence_leaves_unfenced_text_alone():
 
 
 # ---------------------------------------------------------------------------
+# Structured-output schema transform (docs/decisions.md, 2026-08-13): the
+# Anthropic structured-output API rejects/mishandles a JSON Schema `enum`
+# that includes `null` — the documented fix is `anyOf` with a `{"type":
+# "null"}` branch. Every other unsupported keyword is stripped by the SDK
+# itself, not by this function.
+# ---------------------------------------------------------------------------
+
+
+def test_structured_output_schema_converts_enum_with_null_to_anyof():
+    schema = {"enum": ["a", "b", None], "description": "d"}
+    transformed = llm._to_structured_output_schema(schema)
+    assert "enum" not in transformed
+    assert transformed["description"] == "d"
+    assert {"type": "null"} in transformed["anyOf"]
+    enum_branch = next(b for b in transformed["anyOf"] if "enum" in b)
+    assert enum_branch["enum"] == ["a", "b"]
+
+
+def test_structured_output_schema_leaves_null_free_enum_alone():
+    schema = {"enum": ["a", "b"]}
+    assert llm._to_structured_output_schema(schema) == {"enum": ["a", "b"]}
+
+
+def test_structured_output_schema_recurses_into_nested_properties():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"x": {"enum": ["a", None]}, "y": {"type": "string"}},
+    }
+    transformed = llm._to_structured_output_schema(schema)
+    assert "anyOf" in transformed["properties"]["x"]
+    assert transformed["properties"]["y"] == {"type": "string"}
+    assert transformed["additionalProperties"] is False  # untouched, passed through
+
+
+def test_structured_output_schema_recurses_into_array_items():
+    schema = {"type": "array", "items": {"enum": ["a", None]}}
+    transformed = llm._to_structured_output_schema(schema)
+    assert "anyOf" in transformed["items"]
+
+
+@pytest.mark.protected
+def test_real_reply_classification_schema_has_no_enum_containing_null_after_transform():
+    """A live check against the actual shipped schema, not a hand-built
+    fixture — reply_classification.json's objection_category enum includes
+    null, exactly the case this transform exists for."""
+    raw = llm._load_output_schema("outputs/reply_classification.json")
+    transformed = llm._to_structured_output_schema(raw)
+
+    def _walk(node: object) -> None:
+        if isinstance(node, dict):
+            if "enum" in node:
+                assert None not in node["enum"], f"enum-with-null survived transform: {node}"
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(transformed)
+    category = transformed["properties"]["objection_category"]
+    assert "anyOf" in category
+    assert {"type": "null"} in category["anyOf"]
+
+
+def test_load_output_config_has_expected_shape_for_the_anthropic_api():
+    """output_config's shape (`{"format": {"type": "json_schema", "schema":
+    ...}}`) comes from OutputConfigParam/JSONOutputFormatParam in the
+    installed anthropic SDK, introspected via `inspect.signature` /
+    `inspect.getsource` (docs/decisions.md, 2026-08-13) — not assumed."""
+    output_config = llm._load_output_config("outputs/reply_classification.json")
+    output_format = output_config["format"]
+    assert output_format["type"] == "json_schema"
+    assert output_format["schema"]["properties"]["intent"]["enum"] == [
+        "interested",
+        "objection",
+        "not_now",
+        "unsubscribe",
+        "out_of_office",
+        "referral",
+        "unclear",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # V2 — word count tokenisation rule
 #
 # Rule (stated once in core/llm.py::_word_count, applied identically here):

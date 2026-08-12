@@ -139,6 +139,57 @@ async def test_succeeds_on_first_attempt_with_no_retry(conn: asyncpg.Connection)
 
 
 @pytest.mark.protected
+async def test_request_sent_to_model_includes_the_output_schema(conn: asyncpg.Connection):
+    """Regression guard (docs/decisions.md, 2026-08-13): complete_json used to
+    validate the response against the schema but never showed the model the
+    schema in the request — the model then invented plausible-looking enum
+    values and field names from prose alone ('follow_up' instead of
+    'send_followup', 'escalate_to_human' instead of 'escalate_human', etc.).
+    This asserts what was actually SENT, not just what complete_json does
+    with the reply — the class of check the original 190-test suite had none
+    of, which is exactly why the bug was invisible to it."""
+    client = _StubClient([_VALID_CLASSIFICATION])
+    correlation_id = uuid.uuid4()
+    trace = TraceContext(trace_id="t-schema", correlation_id=correlation_id)
+
+    await llm.complete_json(
+        "sales/classify_reply.md",
+        _classify_reply_variables(),
+        "outputs/reply_classification.json",
+        trace,
+        conn=conn,
+        correlation_id=correlation_id,
+        actor="test",
+        client=client,
+    )
+
+    assert len(client.messages.calls) == 1
+    call_kwargs = client.messages.calls[0]
+    assert "output_config" in call_kwargs
+    output_format = call_kwargs["output_config"]["format"]
+    assert output_format["type"] == "json_schema"
+    sent_schema = output_format["schema"]
+
+    # The exact real enum, as sent -- this is what would have caught the
+    # original bug ('follow_up' is not one of [...]).
+    assert sent_schema["properties"]["intent"]["enum"] == [
+        "interested",
+        "objection",
+        "not_now",
+        "unsubscribe",
+        "out_of_office",
+        "referral",
+        "unclear",
+    ]
+    # objection_category mixes an enum with null in the real schema -- must
+    # be transformed to anyOf for the structured-output API, never sent as
+    # an enum containing null (unsupported there).
+    category = sent_schema["properties"]["objection_category"]
+    assert "enum" not in category
+    assert {"type": "null"} in category["anyOf"]
+
+
+@pytest.mark.protected
 async def test_retries_exactly_once_on_schema_invalid_response_then_succeeds(
     conn: asyncpg.Connection,
 ):
@@ -161,9 +212,17 @@ async def test_retries_exactly_once_on_schema_invalid_response_then_succeeds(
 
     assert result["intent"] == "objection"
     assert len(client.messages.calls) == 2
-    # the corrective turn must actually carry the validation error back to the model
+    # the corrective turn must carry both the validation error AND the
+    # schema back to the model (docs/decisions.md, 2026-08-13) -- attempt 2
+    # must not be anchored on attempt 1's wrong shape with only a bare error
+    # string to go on.
     second_call_messages = client.messages.calls[1]["messages"]
-    assert any("failed validation" in m["content"] for m in second_call_messages)
+    corrective = second_call_messages[-1]["content"]
+    assert "failed validation" in corrective
+    assert '"objection_category"' in corrective  # schema text, not just the error
+    # output_config must still be present on the retry call too, not just
+    # the first attempt.
+    assert "output_config" in client.messages.calls[1]
 
     row = await _agent_run_for(conn, "sales/classify_reply")
     assert row is not None

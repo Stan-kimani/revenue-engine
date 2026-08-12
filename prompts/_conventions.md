@@ -68,6 +68,19 @@ Respond with JSON matching the output schema. No prose outside JSON.
   `schemas/outputs/*.json`, not here, but a prompt's `# Output` section should always
   say "Respond with JSON matching the output schema. No prose outside JSON." so the
   model isn't fighting its own instructions against what will actually be validated.
+- **The schema is supplied by `complete_json()`, never by the prompt body.**
+  `complete_json()` passes the resolved `schemas/outputs/*.json` file straight to the
+  model via the Anthropic API's structured-output mechanism
+  (`output_config.format` — constrained generation, not a request phrased nicely) on
+  every call, including retries. A prompt body must **not** paste, summarise, or
+  re-describe the schema's fields, enum values, or shape in prose — `schemas/outputs/`
+  is the single source of truth, and a hand-written copy in a prompt will drift from
+  it the first time the schema changes without the prompt being updated to match.
+  This was a real defect (docs/decisions.md, 2026-08-13): before structured outputs,
+  the model was never shown the schema at all and invented plausible-looking enum
+  values and field names from the prose description alone. The `# Output` section's
+  job is to say *that* the response must match the schema (see the example in §1) —
+  never to restate *what* the schema is.
 - **Every prompt has at least one golden test** (`tests/golden/`, `tests/fixtures/`).
 - **Version bumps are not optional.** `agent_runs` is the only record of which
   wording produced which output; an unbumped version on a real change makes that

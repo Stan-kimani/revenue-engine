@@ -1219,3 +1219,111 @@ against the config's own configured rates, not hardcoded numbers), so no test
 changes were needed. `ruff check`, `ruff format --check`, `mypy --strict` on
 `core/`/`db/`, and the full `tests/unit tests/contracts tests/integration` suite
 (190 tests) all re-run clean after the change.
+
+## 2026-08-13 — complete_json() never showed the model the schema; fixed with structured outputs
+
+**Context:** all 12 golden tests failed the first time they were actually run
+(`ANTHROPIC_API_KEY` became available). Every failure was the model inventing a
+plausible-but-wrong enum value or field name (`'follow_up'` instead of
+`'send_followup'`, `'escalate_to_human'` instead of `'escalate_human'`,
+`'C-Suite'` for a closed `seniority` enum, additional properties not in the
+schema, `None` where a type didn't allow it). Root cause, confirmed by reading
+`complete_json()`: the JSON Schema was used to *validate* the response after
+the call, but was never sent *in* the request — the prompt's `# Output` section
+only said "Respond with JSON matching the output schema," prose the model had
+to infer a shape from. This was invisible to all 197 unit/contract/integration
+tests because none of them inspected the outgoing request — every one of them
+only checked what `complete_json()` did with a canned reply.
+
+**Decision: (b), the Anthropic API's native structured-output mechanism, not
+(a) (appending schema text to the prompt body).** Confirmed available by
+introspecting the installed SDK directly (`anthropic==0.120.2`,
+`inspect.signature`/`inspect.getsource`), the same discipline used for the
+`langfuse` v4 API correction — not trusted from memory or general docs:
+`AsyncMessages.create()` has an `output_config: OutputConfigParam | Omit`
+parameter; `OutputConfigParam.format: JSONOutputFormatParam`;
+`JSONOutputFormatParam = {"type": "json_schema", "schema": dict}`. Then
+cross-checked against
+[https://platform.claude.com/docs/en/build-with-claude/structured-outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
+(fetched 2026-08-13) to confirm behaviour, not just shape: *"The API always
+returns valid JSON matching your schema when structured outputs are enabled"*
+— this constrains generation directly (compiled grammar), not a request phrased
+more persuasively. All three tiers' models (`claude-haiku-4-5-20251001`,
+`claude-sonnet-5`, `claude-opus-5`) are on the documented supported-model list.
+(b) was chosen over (a) because it is strictly stronger — a JSON-shape error
+becomes structurally impossible rather than merely less likely — and because
+sending schema text in the prompt body *and* using `output_config` would be
+redundant (paying tokens twice for the same constraint, one of them
+unenforced). Not layered on top of (a); (b) alone.
+
+**One real transform was required, not zero.** The docs list unsupported
+JSON Schema keywords: numeric/string length constraints (`minLength`,
+`maxLength`, `minimum`, `maximum`) are *"stripped"* by the SDK itself before
+the request is sent (confirmed: *"Python, TypeScript, Ruby, and PHP SDKs
+automatically strip unsupported constraints"*) — nothing to do on our side,
+and our own `jsonschema` validation against the full, untransformed schema
+still catches any real violation afterward, same as before. But `enum`
+containing `null` is different: documented as *"Not Supported... use anyOf
+with `{"type": "null"}` instead"* — not auto-fixed, and three of our nine
+output schemas use exactly that pattern for inferred-value fields
+(`company_enrichment.json`'s `business_model`/`employee_band`/`revenue_signal`,
+`contact_enrichment.json`'s `seniority`/`decision_authority`/`functional_area`,
+`reply_classification.json`'s `objection_category`). Implemented
+`core/llm.py::_to_structured_output_schema()`: a generic recursive transform
+converting any `{"enum": [..., null]}` into `{"anyOf": [{"enum": [...]},
+{"type": "null"}]}`, applied to a derived copy of the schema built fresh for
+`output_config` only — `schemas/outputs/*.json` itself is untouched and
+remains what `_validate_json_response()` checks the response against
+afterward. Chose a generic recursive transform over hand-editing the three
+affected schema files so this can't silently miss a fourth file later, and so
+`schemas/outputs/*.json` stays exactly what the response is validated against
+regardless of what a future structured-output API version does or doesn't
+support.
+
+**Retry feedback now includes the schema, not just the error string**, per
+your explicit instruction, applied regardless of (a)/(b): the corrective
+message appended between attempt 1 and attempt 2 now embeds the full schema
+JSON alongside the validation errors. This matters even with `output_config`
+active on every attempt (including retries) because V1-V9 cross-field failures
+(anchor-id references, word count, pricing honesty) are not JSON Schema
+violations at all — `output_config` cannot prevent them — so the model's
+second attempt needs the schema as grounding context for *why* a business rule
+was violated, not just a bare error sentence anchored on the first attempt's
+wrong shape.
+
+**Regression guard, per your explicit instruction:**
+`tests/integration/test_complete_json.py::test_request_sent_to_model_includes_the_output_schema`
+asserts the actual outgoing stub-client request — not the reply — carries
+`output_config.format.schema` with the real enum values, and specifically that
+`objection_category`'s enum-with-null was transformed to `anyOf`, not sent
+raw. A second new test in the same file asserts the retry's corrective message
+text contains the schema, not just the error string. A third,
+`tests/unit/test_llm.py::test_real_reply_classification_schema_has_no_enum_containing_null_after_transform`,
+walks the *actual shipped* `reply_classification.json` after transform (not a
+hand-built fixture) and asserts no `enum` anywhere in the tree still contains
+`null`. All three are marked `@pytest.mark.protected` — this is exactly the
+class of check whose absence let the original bug ship invisibly through 190
+passing tests.
+
+**`prompts/_conventions.md` updated**: new rule under §3 stating the schema is
+supplied by `complete_json()` via structured outputs on every call and must
+never be duplicated into a prompt body — `schemas/outputs/*.json` is the single
+source of truth; a hand-written copy would drift the first time the schema
+changes without every prompt referencing it being updated to match. Checked
+all 10 existing prompt files for this pattern before writing the rule — none
+duplicate schema content; every `# Output` section already just says "Respond
+with JSON matching the output schema," which the new rule confirms as the
+correct (and only) form.
+
+**Verification:** `ruff check`, `ruff format --check`, `mypy --strict` on
+`core/`/`db/`, and the full `tests/unit tests/contracts tests/integration`
+suite (197 tests, 30 protected) all pass against a disposable Postgres
+instance. One real bug caught during this round's own verification and fixed
+before commit: the first implementation nested `output_config` one level too
+shallow (passed `{"type": "json_schema", "schema": ...}` directly as
+`output_config` instead of wrapping it under a `"format"` key) — caught by the
+new regression test itself failing (`KeyError: 'format'`), not by manual
+inspection, which is exactly the test doing its job. `make golden` output
+(with a real `ANTHROPIC_API_KEY` if available in this session, or the honest
+absence of one if not) is reported separately in chat, per the instruction not
+to fabricate results.
