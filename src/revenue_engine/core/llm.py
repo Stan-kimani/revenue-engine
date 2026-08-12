@@ -321,7 +321,7 @@ def _load_output_config(output_schema: str) -> dict[str, Any]:
 
 
 def _validate_json_response(
-    raw_text: str, validator: jsonschema.Draft202012Validator
+    raw_text: str, validator: jsonschema.Draft202012Validator, output_schema: str
 ) -> tuple[dict[str, Any] | None, list[str]]:
     try:
         candidate = json.loads(_strip_code_fence(raw_text))
@@ -329,6 +329,7 @@ def _validate_json_response(
         return None, [f"response is not valid JSON: {exc}"]
     if not isinstance(candidate, dict):
         return None, ["response is valid JSON but not a JSON object"]
+    _apply_injecting_transforms(output_schema, candidate)
     errors = [e.message for e in validator.iter_errors(candidate)]
     return (candidate if not errors else None), errors
 
@@ -378,21 +379,74 @@ def _v1_facts_asserted_anchors_exist(
 
 
 def _word_count(text: str) -> int:
-    """Tokenisation rule for V2, applied identically by its test: split on
-    whitespace, then keep only tokens containing at least one alphanumeric
-    character (drops pure-punctuation tokens like a lone em-dash). A
-    hyphenated word ("follow-up") or a contraction ("don't") is one token —
-    the hyphen/apostrophe is interior, not a separator — and is counted as
-    one word."""
+    """Tokenisation rule, applied identically wherever a word count matters
+    (word-count injection, V2, and their tests): split on whitespace, then
+    keep only tokens containing at least one alphanumeric character (drops
+    pure-punctuation tokens like a lone em-dash). A hyphenated word
+    ("follow-up") or a contraction ("don't") is one token — the
+    hyphen/apostrophe is interior, not a separator — and is counted as one
+    word."""
     return sum(1 for token in text.split() if any(ch.isalnum() for ch in token))
 
 
-def _v2_word_count_matches(output: dict[str, Any], variables: dict[str, Any]) -> list[str]:
-    body = output.get("body", "")
-    claimed = output.get("word_count")
-    actual = _word_count(body if isinstance(body, str) else "")
-    if not isinstance(claimed, int) or abs(actual - claimed) > 2:
-        return [f"word_count={claimed!r} does not match body's actual word count {actual} (+/-2)"]
+# Token-based models cannot reliably count their own words (docs/decisions.md,
+# 2026-08-14: golden run — a genuinely fine draft was rejected over a 6-word
+# self-report discrepancy, burning a retry on a non-defect). word_count is no
+# longer part of what the model is asked for at all (dropped from
+# schemas/outputs/outreach_draft.json's `required`, and from
+# draft_initial_outreach.md's rules) — it is a derivable fact computed from
+# `body`, injected by complete_json() before schema validation ever runs
+# (agent-contracts.md §0.2: derivable facts are computed, not asked for).
+def _inject_word_count(candidate: dict[str, Any]) -> None:
+    body = candidate.get("body")
+    candidate["word_count"] = _word_count(body) if isinstance(body, str) else 0
+
+
+InjectingTransform = Callable[[dict[str, Any]], None]
+
+_INJECTING_TRANSFORMS: dict[str, list[InjectingTransform]] = {
+    "outputs/outreach_draft.json": [_inject_word_count],
+}
+
+
+def _apply_injecting_transforms(output_schema: str, candidate: dict[str, Any]) -> None:
+    """Runs BEFORE schema validation — unlike the correcting/rejecting
+    V-hooks below, which only ever see a candidate that already passed the
+    JSON Schema (word_count wouldn't exist yet for validation to check if it
+    weren't injected first)."""
+    for transform in _INJECTING_TRANSFORMS.get(output_schema, []):
+        transform(candidate)
+
+
+# draft_initial_outreach.md Rule 3: "Under 120 words in the body." One
+# deliberate, explicitly-flagged duplication of a number that also lives in
+# that prompt's prose (docs/decisions.md, 2026-08-14) — CLAUDE.md §1
+# non-negotiable 3 is about prompt WORDING never living in Python, not about
+# a schema-adjacent numeric limit also being asserted in code; unlike the
+# enum/field-name duplication the structured-output fix eliminated, there is
+# no single machine-readable source this number could instead be read from
+# without inventing one. schemas/outputs/outreach_draft.json's own
+# word_count bounds (20-220) stay a generic, shared sanity range on purpose
+# — this constant is the real, tighter business rule. draft_followup.md has
+# no fixed number of its own ("shorter than the previous message" is
+# relative), so this same ceiling applies there too: a followup can never
+# legitimately need to exceed what the initial outreach was already capped
+# at.
+_OUTREACH_MAX_WORDS = 120
+
+
+def _v2_word_count_within_limit(output: dict[str, Any], variables: dict[str, Any]) -> list[str]:
+    """word_count is now always code-injected from body's real word count
+    (_inject_word_count, applied before schema validation) — it can no
+    longer diverge from the body by construction, so there is nothing left
+    to "match" against a self-report. V2's job changes to enforcing the
+    actual constraint the self-report was only ever a proxy for: is the
+    draft short enough. Schema validation alone can't own this number
+    (word_count's own bounds are deliberately generic, see
+    _OUTREACH_MAX_WORDS above), so it stays a cross-field check here."""
+    word_count = output.get("word_count")
+    if isinstance(word_count, int) and word_count > _OUTREACH_MAX_WORDS:
+        return [f"word_count={word_count} exceeds the {_OUTREACH_MAX_WORDS}-word limit"]
     return []
 
 
@@ -529,7 +583,7 @@ RejectingValidator = Callable[[dict[str, Any], dict[str, Any]], list[str]]
 CorrectingValidator = Callable[[dict[str, Any], dict[str, Any]], None]
 
 _REJECTING_VALIDATORS: dict[str, list[RejectingValidator]] = {
-    "outputs/outreach_draft.json": [_v1_facts_asserted_anchors_exist, _v2_word_count_matches],
+    "outputs/outreach_draft.json": [_v1_facts_asserted_anchors_exist, _v2_word_count_within_limit],
     "outputs/account_brief.json": [_v3_supporting_anchors_exist],
     "outputs/lead_subscores.json": [_v6_subscore_evidence_nonempty],
     "outputs/reply_classification.json": [_v7_objection_category_only_if_objection],
@@ -640,7 +694,7 @@ async def complete_json(
         input_tokens += in_tok
         output_tokens += out_tok
 
-        candidate, errors = _validate_json_response(raw_text, validator)
+        candidate, errors = _validate_json_response(raw_text, validator, output_schema)
         if candidate is not None:
             _apply_correcting_validators(output_schema, candidate, variables)
             rejecting_errors = _apply_rejecting_validators(output_schema, candidate, variables)

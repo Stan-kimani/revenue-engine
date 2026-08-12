@@ -391,6 +391,111 @@ async def test_v4_forces_pricing_present_through_the_full_call_path(conn: asyncp
     assert row["status"] == AgentRunStatus.SUCCESS.value
 
 
+# ---------------------------------------------------------------------------
+# word_count is no longer model-supplied (docs/decisions.md, 2026-08-14):
+# models cannot reliably count their own words, and rejecting an otherwise-
+# good draft over a self-report discrepancy burned a retry on a non-defect.
+# complete_json injects the real, computed count before schema validation;
+# V2 now enforces draft_initial_outreach.md's actual 120-word rule.
+# ---------------------------------------------------------------------------
+
+
+def _draft_initial_outreach_variables() -> dict[str, Any]:
+    return {
+        "account_brief": {
+            "angle": "General fit for the ICP.",
+            "supporting_anchors": [],
+            "proof_to_reference": [],
+            "avoid": [],
+            "confidence": 0.5,
+        },
+        "prospect_profile": {"personalization_anchors": []},
+        "sender_persona": "A practitioner writing to another operator.",
+        "voice_rules": "Be direct. Short sentences.",
+        "constraints": "Do not assert any specific fact not grounded in an anchor.",
+    }
+
+
+def _outreach_draft_response(word_count_words: int) -> str:
+    """Deliberately omits word_count entirely -- the model is no longer
+    asked for it (schemas/outputs/outreach_draft.json no longer requires
+    it; draft_initial_outreach.md no longer instructs the model to report
+    it)."""
+    body = " ".join(["word"] * word_count_words)
+    return json.dumps(
+        {
+            "subject": "a quick question about intake",
+            "body": body,
+            "cta": {"kind": "question", "text": "Worth a quick reply?"},
+            "facts_asserted": [],
+            "tone_check": {"matches_voice_rules": True, "notes": "Direct, no fluff."},
+        }
+    )
+
+
+@pytest.mark.protected
+async def test_body_exceeding_word_limit_is_rejected_after_structured_output_strip(
+    conn: asyncpg.Connection,
+):
+    """A draft whose real body is well over draft_initial_outreach.md's
+    120-word rule must still be rejected -- retried once, then raise, since
+    both stubbed attempts here are equally over limit. Proves V2 is
+    reachable (not preempted by the schema's own, deliberately looser
+    word_count bounds)."""
+    too_long = _outreach_draft_response(150)
+    client = _StubClient([too_long, too_long])
+    correlation_id = uuid.uuid4()
+    trace = TraceContext(trace_id="t-wc-over", correlation_id=correlation_id)
+
+    with pytest.raises(LLMValidationError) as exc_info:
+        await llm.complete_json(
+            "sales/draft_initial_outreach.md",
+            _draft_initial_outreach_variables(),
+            "outputs/outreach_draft.json",
+            trace,
+            conn=conn,
+            correlation_id=correlation_id,
+            actor="test",
+            client=client,
+        )
+
+    assert len(client.messages.calls) == 2
+    assert any("150" in e for e in exc_info.value.errors)
+
+
+@pytest.mark.protected
+async def test_body_within_word_limit_succeeds_with_injected_word_count(
+    conn: asyncpg.Connection,
+):
+    """The counterpart: a draft within the limit succeeds on the first
+    attempt, and the returned dict carries the real, code-computed
+    word_count -- the model didn't report one at all here, and none was
+    needed."""
+    within_limit = _outreach_draft_response(80)
+    client = _StubClient([within_limit])
+    correlation_id = uuid.uuid4()
+    trace = TraceContext(trace_id="t-wc-under", correlation_id=correlation_id)
+
+    result = await llm.complete_json(
+        "sales/draft_initial_outreach.md",
+        _draft_initial_outreach_variables(),
+        "outputs/outreach_draft.json",
+        trace,
+        conn=conn,
+        correlation_id=correlation_id,
+        actor="test",
+        client=client,
+    )
+
+    assert len(client.messages.calls) == 1
+    assert result["word_count"] == 80
+
+    row = await _agent_run_for(conn, "sales/draft_initial_outreach")
+    assert row is not None
+    assert row["status"] == AgentRunStatus.SUCCESS.value
+    assert row["retry_count"] == 0
+
+
 async def test_frontmatter_output_schema_mismatch_raises_before_any_call(conn: asyncpg.Connection):
     client = _StubClient([_VALID_CLASSIFICATION])
     correlation_id = uuid.uuid4()

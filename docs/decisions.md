@@ -1402,3 +1402,103 @@ still function exactly as before this feature existed.
 against a disposable Postgres instance, torn down after. Not re-run against
 the live API in this environment (no `ANTHROPIC_API_KEY` here) — you're
 re-running `make golden` yourself, which is the real test of this fix.
+
+## 2026-08-14 — word_count becomes code-computed, not model-reported
+
+**Context:** 10/12 golden tests passed after the structured-output fixes above.
+The remaining real failure —
+`test_profile_no_anchors_yields_outreach_draft_with_empty_facts_asserted` —
+rejected an otherwise-good draft: `"word_count=80 does not match body's
+actual word count 74 (+/-2)"`, a 6-word self-report discrepancy. Confirmed as
+V2's design being wrong, not a model error: token-based models cannot
+reliably count their own words, so V2 was asking the model to do arithmetic
+on its own output and burning a retry (or risking a dead-letter) over a
+non-defect.
+
+**Decision: word_count is no longer part of what the model is asked for at
+all.** This follows agent-contracts.md §0.2's deterministic/LLM split
+directly, quoted verbatim: *"If the answer is derivable from data by a rule,
+it is code. The LLM is only for reading unstructured text and making a
+judgment a rule cannot express... Arithmetic ... — always code."* A word
+count is a pure function of `body` — exactly the kind of thing that rule
+says must never be an LLM task in the first place; V2's original design (ask
+the model to self-report, then check it) violated this from the start, just
+not visibly until a real run actually rejected a good draft over it.
+
+**Implementation, matching the instruction exactly:**
+- `schemas/outputs/outreach_draft.json`: `word_count` removed from
+  `required` (the model may omit it — and does, going forward). Kept as a
+  property with its existing generic bounds (`minimum: 20`, `maximum: 220`)
+  unchanged — deliberately loose, a basic sanity range shared by both
+  prompts, not the real business rule (see below). Description updated to
+  say it's code-computed and injected, not model-reported.
+- `core/llm.py`: new `_inject_word_count()`, computed via the tokenisation
+  rule already defined for V2 (whitespace split, keep tokens with at least
+  one alphanumeric character), registered in a new `_INJECTING_TRANSFORMS`
+  dict keyed by `output_schema` (parallel to `_CORRECTING_VALIDATORS`/
+  `_REJECTING_VALIDATORS`) and applied via `_apply_injecting_transforms()`
+  — called from `_validate_json_response()` **before** `validator.iter_errors()`
+  runs, not after. This ordering is load-bearing: `word_count` isn't in
+  `required` anymore, but the property still exists in the schema with a
+  type/bounds constraint, so it needs a real value in place before ordinary
+  JSON Schema validation checks it. Unconditionally overwrites — if a model
+  includes a `word_count` anyway (still a valid, just-not-required property),
+  it's discarded, never trusted.
+- V2 (`_v2_word_count_matches` → `_v2_word_count_within_limit`): since
+  `word_count` is now always code-injected, it can no longer diverge from
+  `body` by construction — there is nothing left to "match" a self-report
+  against. V2's job changes to enforcing the actual constraint the
+  self-report was only ever a proxy for: is the draft short enough. Checks
+  against a new module constant, `_OUTREACH_MAX_WORDS = 120`, mirroring
+  `draft_initial_outreach.md`'s own Rule 3 ("Under 120 words in the body").
+  **One deliberate, explicitly-flagged exception to "no prompt content in
+  Python"**: this is a single integer, not prompt wording, and CLAUDE.md §1
+  non-negotiable 3 is about prose living in `.py` files, not about a
+  schema-adjacent numeric limit also being asserted in code — there is no
+  other machine-readable source this number could be read from instead
+  (unlike the earlier structured-output fix, which eliminated an actual
+  *duplicated schema shape* by making `complete_json()` the single place the
+  schema is expressed). Flagged here specifically so it can't silently drift
+  from the prompt file's own stated number if that number ever changes.
+  `draft_followup.md` has no fixed word count of its own — Rule 4 is
+  relative ("Shorter than the previous message in the thread") — so the same
+  120-word ceiling applies there too, deliberately: a followup can never
+  legitimately need to exceed what the initial outreach was already capped
+  at, and `outreach_draft.json` is explicitly documented as shared by both
+  prompts.
+- `schemas/outputs/outreach_draft.json`'s own `word_count.maximum` (220)
+  stays a generic, shared sanity ceiling on purpose, not tightened to 120 —
+  keeping V2 as the actual enforcer of the real limit rather than letting
+  ordinary schema validation silently absorb that job (which would make V2
+  unreachable dead code, since `_apply_rejecting_validators` only ever runs
+  on a candidate that already passed schema validation).
+- `docs/phase1-llm-boundary.md` §4's V2 table row updated to describe the
+  new check — a binding doc's own table describing stale behaviour is
+  exactly the drift this project has otherwise been careful to avoid.
+- `prompts/sales/draft_initial_outreach.md`: Rule 7 ("`word_count` must
+  equal the real word count of `body`. It is checked in code.") removed.
+  Rule 3 ("Under 120 words") kept verbatim — that's the actual constraint,
+  unaffected by this change. **`prompts/sales/draft_followup.md` needed no
+  edit** — grepped both files for `word_count` before editing either; only
+  `draft_initial_outreach.md` ever had a line naming it explicitly.
+  `draft_followup.md`'s Rule 1 ("All rules from draft_initial_outreach
+  apply") referenced the old rule only by inheritance, with nothing of its
+  own to remove.
+
+**Tests, per your explicit instructions:** a stubbed response with a body
+well over 120 words is rejected (retried once, then raises,
+`test_body_exceeding_word_limit_is_rejected_after_structured_output_strip`);
+one within the limit succeeds on the first attempt and the returned dict
+carries the real, code-computed `word_count` — the stub deliberately omits
+`word_count` entirely, since the model is no longer asked for it
+(`test_body_within_word_limit_succeeds_with_injected_word_count`). Plus unit
+coverage for `_inject_word_count()` directly (computes from body, overwrites
+any model-supplied value, handles a missing body) and for `_v2_word_count_within_limit()`
+(rejects over limit, accepts under and at exactly the limit, and — the
+explicit regression check that the *old* behaviour is really gone — accepts
+a wildly-wrong-but-under-limit `word_count`, proving V2 no longer compares
+against a self-report at all).
+
+**Verification:** `ruff check`, `ruff format --check`, `mypy --strict` on
+`core/`/`db/`, and the full suite (224 tests now, 44 protected) all pass
+against a disposable Postgres instance, torn down after.

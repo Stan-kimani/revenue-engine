@@ -239,11 +239,17 @@ def test_load_output_config_has_expected_shape_for_the_anthropic_api():
 
 
 # ---------------------------------------------------------------------------
-# V2 — word count tokenisation rule
+# word_count injection + V2 (docs/decisions.md, 2026-08-14): word_count is no
+# longer model-reported — models cannot reliably count their own words, and
+# rejecting an otherwise-good draft over the self-report being a few words
+# off burns a retry (or dead-letters a valid email) over nothing. complete_json
+# now injects the real, computed count before schema validation ever runs;
+# V2's job changes from "does the self-report match" (structurally impossible
+# to fail now) to "is the real count within the limit the prompt states".
 #
-# Rule (stated once in core/llm.py::_word_count, applied identically here):
-# split on whitespace, keep tokens with at least one alphanumeric character.
-# A hyphenated word or a contraction is one token, not two.
+# Tokenisation rule (stated once in core/llm.py::_word_count, applied
+# identically here): split on whitespace, keep tokens with at least one
+# alphanumeric character. A hyphenated word or a contraction is one token.
 # ---------------------------------------------------------------------------
 
 
@@ -259,22 +265,54 @@ def test_word_count_ignores_punctuation_only_tokens():
     assert llm._word_count("wait - then go") == 3  # lone "-" is not a word
 
 
-def test_v2_accepts_matching_word_count():
-    output = {"body": "one two three four five", "word_count": 5}
-    assert llm._v2_word_count_matches(output, {}) == []
+def test_inject_word_count_computes_from_body():
+    candidate = {"body": "one two three four five"}
+    llm._inject_word_count(candidate)
+    assert candidate["word_count"] == 5
 
 
-def test_v2_rejects_mismatched_word_count():
-    output = {"body": "one two three", "word_count": 40}
-    errors = llm._v2_word_count_matches(output, {})
-    assert errors and "40" in errors[0]
+def test_inject_word_count_overwrites_any_model_supplied_value():
+    """word_count is no longer required in the schema, but if a model
+    includes one anyway, code is the only authoritative source now — the
+    model's own number is always discarded, never trusted."""
+    candidate = {"body": "one two three", "word_count": 9999}
+    llm._inject_word_count(candidate)
+    assert candidate["word_count"] == 3
 
 
-def test_v2_tolerates_plus_minus_two():
-    output = {"body": "one two three four five", "word_count": 7}
-    assert llm._v2_word_count_matches(output, {}) == []
-    output["word_count"] = 8
-    assert llm._v2_word_count_matches(output, {}) != []
+def test_inject_word_count_handles_missing_body():
+    candidate: dict[str, object] = {}
+    llm._inject_word_count(candidate)
+    assert candidate["word_count"] == 0
+
+
+@pytest.mark.protected
+def test_v2_rejects_body_exceeding_the_word_limit():
+    body = " ".join(["word"] * 150)
+    output = {"body": body, "word_count": 150}
+    errors = llm._v2_word_count_within_limit(output, {})
+    assert errors and "150" in errors[0] and str(llm._OUTREACH_MAX_WORDS) in errors[0]
+
+
+@pytest.mark.protected
+def test_v2_accepts_body_within_the_word_limit():
+    body = " ".join(["word"] * 100)
+    output = {"body": body, "word_count": 100}
+    assert llm._v2_word_count_within_limit(output, {}) == []
+
+
+def test_v2_accepts_body_at_exactly_the_limit():
+    output = {"body": "x", "word_count": llm._OUTREACH_MAX_WORDS}
+    assert llm._v2_word_count_within_limit(output, {}) == []
+
+
+def test_v2_no_longer_compares_against_a_self_report():
+    """The old behaviour (reject if word_count != actual body count, even
+    within limit) must be gone -- a self-reported number that's simply wrong
+    but still under the limit is no longer V2's concern, since word_count is
+    always code-injected before V2 ever runs in the real pipeline."""
+    output = {"body": "one two three", "word_count": 40}  # wildly wrong, but under the limit
+    assert llm._v2_word_count_within_limit(output, {}) == []
 
 
 # ---------------------------------------------------------------------------

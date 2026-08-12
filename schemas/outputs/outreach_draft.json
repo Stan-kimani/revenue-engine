@@ -7,7 +7,6 @@
   "required": [
     "subject",
     "body",
-    "word_count",
     "cta",
     "facts_asserted",
     "tone_check"
@@ -28,7 +27,7 @@
       "type": "integer",
       "minimum": 20,
       "maximum": 220,
-      "description": "Must match the actual body word count; validated in code."
+      "description": "Not model-supplied. complete_json() computes this from `body`'s real word count and injects it before validation — a generous sanity floor/ceiling only; the actual per-prompt limit (e.g. draft_initial_outreach.md's 120-word rule) is enforced by V2 in core/llm.py, not by this bound."
     },
     "cta": {
       "type": "object",

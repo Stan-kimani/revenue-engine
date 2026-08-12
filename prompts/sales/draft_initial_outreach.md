@@ -38,7 +38,6 @@ Constraints:
 5. One CTA. Make it low-friction: a question they can answer in a sentence beats a
    calendar link in a first touch.
 6. Do not mention AI, automation of this email, or that a system wrote it.
-7. `word_count` must equal the real word count of `body`. It is checked in code.
 
 # Output
 Return only JSON matching the output schema.

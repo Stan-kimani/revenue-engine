@@ -62,7 +62,7 @@ or in the calling agent, and fail the same way a schema failure fails.
 | # | Check | Applies to | On failure |
 |---|---|---|---|
 | V1 | every `facts_asserted[].anchor_id` exists in the source profile | outreach_draft | reject draft, retry once, then dead-letter |
-| V2 | `word_count` equals real word count of `body` (±2) | outreach_draft | reject |
+| V2 | code-computed real word count of `body` is within the prompt's stated limit (`word_count` is no longer model-supplied — `complete_json` computes and injects it; see docs/decisions.md 2026-08-14) | outreach_draft | reject |
 | V3 | every `supporting_anchors[]` exists in profile | account_brief | reject |
 | V4 | `pricing_present` is true if body text contains any currency/number pattern | proposal_draft | force `requires_approval`, log honesty violation |
 | V5 | `precedents_used[]` ⊆ ids actually retrieved and passed in | objection_response | strip unknown ids, log |
