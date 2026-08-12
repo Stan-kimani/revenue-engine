@@ -955,3 +955,205 @@ after, both refusal scenarios (unset / equal) confirmed to abort the session
 before any connection is attempted, and `revenue_engine_test` confirmed
 created automatically by `\l`. `pytest -m protected --collect-only` shows 18
 protected tests.
+
+## 2026-08-11 — M0.4: core/config.py, core/llm.py, core/observability.py, golden harness
+
+Several judgment calls made while implementing, beyond the four already resolved
+in the approved plan (Langfuse SDK not hand-rolled, model IDs verified against
+docs.claude.com before use, `reply_ooo`'s `out_of_office` enum value confirmed
+present, `prompts/_conventions.md` written).
+
+**`agent_runs` extended beyond build-spec §5.1's locked shape.** build-spec §5.1
+and `entity-model.md` §7 describe `agent_runs` as `(agent, trigger_event, trace_id,
+cost, latency, status)` — "locked... need no domain decisions" — and
+`migrations/0001_init.sql` matches that exactly. The instruction for this
+milestone explicitly required `complete_json()` to record "prompt_version, tier,
+model, token counts and cost to agent_runs", none of which that shape has columns
+for (`lead_scores` has its own `prompt_version`/`model` columns instead — a
+different table, populated by a later milestone). Per CLAUDE.md §0 ("later
+documents supersede earlier ones; the build spec is the oldest") and because this
+was a direct, explicit instruction rather than an inferred one, added
+`migrations/0002_agent_runs_llm_fields.sql` (additive `ALTER TABLE`: `prompt_id`,
+`prompt_version`, `tier`, `model`, `input_tokens`, `output_tokens`, `retry_count`)
+rather than inventing a place to put these fields that contradicts the instruction.
+Flagging rather than silently resolving, since it is a real conflict between two
+binding documents under CLAUDE.md's own conflict rule.
+
+**V4 "force `requires_approval`" reinterpreted as "force `pricing_present: true`".**
+`docs/phase1-llm-boundary.md` §4's table says V4's on-failure action is "force
+`requires_approval`, log honesty violation". `schemas/outputs/proposal_draft.json`
+has no `requires_approval` property and `additionalProperties: false` — adding one
+would itself be a schema violation. The schema's own description states
+proposals are "Always approval-gated (A2)" unconditionally, and that
+"`pricing_present` is used by the gate" — i.e. `pricing_present` *is* the field
+the approval gate reads, not a separate flag. Implemented V4 as forcing
+`pricing_present: true` only; "force requires_approval" is satisfied because
+every proposal is already approval-gated regardless, and forcing the honest value
+of the one field the gate actually inspects is the mechanism, not a literal
+second field.
+
+**`complete_json()` signature expanded**, same pattern as `core/events.py::emit()`
+in M0.3: `conn`, `correlation_id`, `actor` (required keyword-only — `agent_runs`
+and a possible `llm.validation_failed` emission both need them, unconditionally),
+`causation_id` (doubles as `agent_runs.trigger_event` — one caller-supplied value
+backs both, since both mean "the event that caused this call"), and `client`
+(injectable Anthropic client, defaulting to a real `AsyncAnthropic()` — this is
+what makes the protected retry/failure tests possible without an API key).
+
+**Retry-once protected tests placed in `tests/integration/`, not `tests/unit/`.**
+The instruction listed them under "tests/unit and tests/contracts — no API key
+needed". They don't need an API key (the Anthropic client is always stubbed) but
+they do write real `agent_runs` rows and may emit a real `llm.validation_failed`
+event — build-spec §8.1 scopes unit tests to "no network, no LLM" but doesn't say
+"no database", and §8.4 describes integration tests as running "against a real
+test database with mocked integrations", which is exactly this shape (Postgres
+real, Anthropic client the mocked integration). Followed the project's own
+established DB-testing convention (`TEST_DATABASE_URL`, the `conn` fixture
+pattern already used in `tests/integration/test_events.py` and
+`test_queue.py`) rather than the literal directory name, and split accordingly:
+pure V1-V9/render logic in `tests/unit/test_llm.py` (no I/O at all), full
+`complete_json()` control-flow tests in `tests/integration/test_llm.py`. Golden
+tests needed the same real-database access for the same reason, so
+`tests/golden/conftest.py` reuses `tests/_db_safety.py`'s safety check directly
+rather than re-deriving it — it does not auto-create/migrate the test database
+the way `tests/integration/conftest.py` does, since golden tests are invoked
+manually well after `make test`/`make migrate` has already run at least once in
+any real workflow; duplicating that bootstrap for a money-costing, manually-run
+category wasn't worth it.
+
+**Cost table uses standard, not introductory, Sonnet 5 pricing.** Sonnet 5 has
+introductory pricing ($2/$10 per MTok) through 2026-08-31 per
+docs.claude.com. `config/base.yaml`'s `models.standard.*_cost_per_mtok` uses the
+standard post-introductory rate ($3/$15) deliberately, so `agent_runs.cost`
+doesn't silently jump when introductory pricing ends — a cost figure that changes
+meaning on a date nobody configured is worse than a cost figure that's
+conservatively a little high before then.
+
+**`test_pack_supplies_all_variables`'s two-bucket design** (config-resolvable vs.
+`RUNTIME_VARIABLES`) was your explicit answer to the pre-plan question — recorded
+here because the actual per-variable classification (30 variables across the 10
+prompt files, listed with a comment per entry naming which future agent supplies
+each runtime one) was a judgment call made while writing
+`tests/contracts/test_prompts_valid.py`, not something the answer itself
+specified variable-by-variable. `step_intent` was the one genuinely ambiguous
+case: it looks like per-call sequence state but is actually
+`pack.sequences.default.steps[N].intent`, a pack-authored string looked up by
+step number — classified as config-resolvable, not runtime.
+
+**V2's word-count tokenisation rule**, per your instruction to state it once and
+apply it identically in code and tests: split on whitespace, keep tokens
+containing at least one alphanumeric character. A hyphenated word or a
+contraction is one token. Stated in `core/llm.py::_word_count`'s docstring and
+applied unchanged in `tests/unit/test_llm.py`.
+
+**`schemas/entities/industry_pack.json` typed accessors are partial by design.**
+`core/config.py`'s `IndustryPack` deep-models only the sections M0.4 code
+actually touches (`status`, `scoring`, `voice`, `objection_categories`); `icp`,
+`qualification`, `commercial_boundaries`, `sequences`, `service_catalogue`,
+`discovery`, `channels`, `account_limits` are exposed as read-only
+`MappingProxyType` attributes rather than hand-modelled dataclasses — every
+section is still reached through a named attribute (never a raw dict key on the
+loaded YAML), but full field-level typing waits for the milestone that consumes
+each section (CLAUDE.md §4: minimum abstraction, no speculative modelling).
+
+### Defects found during verification (not from reading the code)
+
+**`langfuse` v2-era API assumed, installed package is v4 (OTel-based).**
+`pyproject.toml` pinned `langfuse>=2.0` (open, per DECISION 1 — no upper bound was
+specified or asked for); `uv sync` resolved `langfuse==4.14.3`. Introspected the
+actual installed package (`inspect.signature`) rather than trusting memory or docs
+that could be stale for a fast-moving SDK: `Langfuse(public_key=..., secret_key=...,
+host=...)` still constructs the client, but there is no `.generation()` method —
+span/generation creation is `client.start_observation(trace_context={"trace_id":
+...}, as_type="generation", model=..., metadata=..., usage_details=...,
+cost_details=..., level=...)`, returning an object with `.end()`, then
+`client.flush()`. `core/observability.py` and its tests were written against this
+confirmed real shape, not the assumed one. `usage_details`/`cost_details` taking
+real dicts (not the placeholder `None`s in the first draft) meant threading
+`input_tokens`/`output_tokens` through `record_span()`, an improvement made
+possible by the correction.
+
+**`.env.example` had a bug that broke the M0.3 TEST_DATABASE_URL safety
+mechanism.** `DATABASE_URL` and `TEST_DATABASE_URL` were byte-identical
+(`.../revenue_engine_test`, both with a stray `' >> .env` shell-artifact suffix) —
+directly violating the invariant `tests/_db_safety.py` exists to enforce, and
+which the file's own adjacent comment states. Traced via `git log`/`git show` to
+two manual commits made just before this session (`a6d719c` "postgres edit",
+`042d3b3` "database url edit", both 2026-08-10 — a shell redirect that landed
+partially inside the file instead of running), not an M0.1-era latent bug as
+first assumed here — corrected after checking, not left as a misattribution.
+Never caught because nothing had run `cp .env.example .env` and then the suite
+since those commits landed. Fixed: `DATABASE_URL` points at `revenue_engine`
+(matching `docker-compose.yml`'s default), `TEST_DATABASE_URL` at
+`revenue_engine_test`, artifact suffix removed from both.
+
+**`config/industries/b2b-service-firms.yaml` had an unquoted colon inside a
+`tone_rules` list item.** `- Concrete over abstract: name the workflow, not "your
+processes".` parses in YAML as a one-key mapping (`{"Concrete over abstract":
+"..."}`), not a string — because of the `: ` — silently turning one `tone_rules`
+entry into an object where `schemas/entities/industry_pack.json` (and the
+`array of string` the field is supposed to be) expects a string. Never caught
+before this milestone because nothing validated the pack against a schema until
+`core/config.py` existed to do it — this is exactly the defect class that
+validation exists to catch, and did, on the very first real load. Fixed by
+single-quoting the line. Checked the rest of the file for the same pattern
+(`grep` for other unquoted `- ...: ...` list items) — the only other colon-bearing
+list items are genuine, intentional mappings (`disqualifiers`, `discovery_checklist`,
+`sequences.default.steps`, all objects with named keys), not accidental strings.
+
+**`prompts/leadgen/build_prospect.md` — filename didn't match its own frontmatter
+`id`.** Frontmatter declared `id: leadgen/build_prospect_profile`; the file itself
+was `build_prospect.md`, missing `_profile`. Caught by the new
+`test_frontmatter_id_matches_own_path` contract test — the same check
+`core/llm.py::_load_prompt()` enforces at runtime, which means this prompt was
+previously unusable end to end (`complete_json()` would always have raised).
+Checked every other of the 10 prompt files for the same class of mismatch — none
+found, this was isolated. Before renaming, checked whether the *id* or the
+*filename* was the outlier: `docs/agent-contracts.md`, `docs/phase1-llm-boundary.md`,
+`docs/competitive-deltas.md`, and `docs/revenue-engine-build-spec.md`'s own repo
+layout diagram all independently and consistently say `build_prospect_profile`
+(never `build_prospect`) — four-for-four agreement is not "a path seems wrong,
+ask" territory (CLAUDE.md §1 non-negotiable 1); it's fixing a typo against
+unanimous, already-binding documentation. Renamed the file to
+`build_prospect_profile.md`; grepped the repo afterward for any remaining
+reference to the old name (none).
+
+**Two files sharing the basename `test_llm.py` across `tests/unit/` and
+`tests/integration/` collided under pytest's default import mode** (neither
+directory has `__init__.py`, so both resolved to the same top-level module name).
+Renamed the integration one to `tests/integration/test_complete_json.py` rather
+than adding `__init__.py` to every test subdirectory — the narrower fix, since
+restructuring how pytest imports the *entire* existing suite for one new
+collision risked side effects on already-verified M0.1-M0.3 tests that weren't
+worth it for this.
+
+**Four `core/config.py` pack-selection tests were polluted by `.env`'s own new
+`INDUSTRY_PACK=b2b-service-firms` default** (added to `.env.example` by this same
+milestone) — `os.environ.get("INDUSTRY_PACK")` resolved before the autodetection
+path these tests meant to exercise ever ran, since `tests/conftest.py` loads the
+real `.env` for every test process. Fixed by having those four tests
+`monkeypatch.delenv("INDUSTRY_PACK", raising=False)` explicitly, rather than
+relying on the variable happening to be absent — which stopped being true the
+moment this milestone gave it a real default.
+
+**Not a code defect, flagged for you:** the pre-existing, 8-hours-old
+`revenue-engine-postgres-1` container (this machine's real dev database,
+`docker-compose.yml`'s project) is reachable on `localhost:5432` but its actual
+Postgres password does not match `.env`'s `revenue_engine`/`revenue_engine`
+(`password authentication failed`) — its data volume was almost certainly
+initialised under different credentials at some point before this session, and
+Postgres only applies `POSTGRES_PASSWORD` on first init of an empty data
+directory, not on every container start. `make migrate`/`make test` against it
+will fail the same way until that's reconciled (reset the volume with `docker
+compose down -v` if its data isn't needed, or `ALTER ROLE revenue_engine WITH
+PASSWORD 'revenue_engine'` from inside the container if it is). Not touched or
+reset in this session — all verification here ran against a separate, disposable
+instance instead (see below), specifically to avoid guessing at what that
+container's data is worth.
+
+### Verification
+
+See the M0.4 verification report (chat) for the full §7 write-up: real command
+output, `git diff --stat HEAD -- tests/`, iteration/triage log, and the NOT
+VERIFIED section (golden tests were built but not executed — no
+`ANTHROPIC_API_KEY` in this environment).

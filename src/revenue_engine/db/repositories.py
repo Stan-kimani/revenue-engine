@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -26,6 +27,8 @@ from ..core.errors import (
     RevenueEngineError,
 )
 from .models import (
+    AgentRun,
+    AgentRunStatus,
     BudgetBand,
     BudgetSource,
     Company,
@@ -41,6 +44,7 @@ from .models import (
     LeadStatus,
     PainCategory,
     TeamSizeBand,
+    Tier,
 )
 
 _ATTRIBUTE_SCHEMA_PATH = (
@@ -624,6 +628,64 @@ async def mark_job_failed(
 
 
 # ============================================================================
+# Agent runs (core/llm.py::complete_json() — M0.4)
+# ============================================================================
+
+
+async def insert_agent_run(
+    conn: asyncpg.Connection,
+    *,
+    agent: str,
+    trigger_event: UUID | None,
+    trace_id: str | None,
+    prompt_id: str,
+    prompt_version: int,
+    tier: Tier,
+    model: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cost: Decimal | None,
+    latency_ms: int | None,
+    status: AgentRunStatus,
+    error: str | None,
+    retry_count: int,
+) -> AgentRun:
+    """Insert one agent_runs row. Always a plain INSERT, never an upsert —
+    each complete_json() call (success or failure) is its own row; there is
+    no natural key to dedupe on and none is wanted (docs/decisions.md)."""
+    row = await conn.fetchrow(
+        """
+        INSERT INTO agent_runs (agent, trigger_event, trace_id, prompt_id, prompt_version,
+                                 tier, model, input_tokens, output_tokens, cost, latency_ms,
+                                 status, error, retry_count)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        RETURNING *
+        """,
+        agent,
+        trigger_event,
+        trace_id,
+        prompt_id,
+        prompt_version,
+        tier.value,
+        model,
+        input_tokens,
+        output_tokens,
+        cost,
+        latency_ms,
+        status.value,
+        error,
+        retry_count,
+    )
+    assert row is not None
+    return _row_to_agent_run(row)
+
+
+async def get_agent_run(conn: asyncpg.Connection, run_id: UUID) -> AgentRun | None:
+    row = await conn.fetchrow("SELECT * FROM agent_runs WHERE id = $1", run_id)
+    return _row_to_agent_run(row) if row else None
+
+
+# ============================================================================
 # Row -> model mapping
 # ============================================================================
 
@@ -698,6 +760,27 @@ def _row_to_event(row: asyncpg.Record) -> Event:
         idempotency_key=row["idempotency_key"],
         payload=json.loads(row["payload"]),
         processed_at=row["processed_at"],
+    )
+
+
+def _row_to_agent_run(row: asyncpg.Record) -> AgentRun:
+    return AgentRun(
+        id=row["id"],
+        agent=row["agent"],
+        trigger_event=row["trigger_event"],
+        trace_id=row["trace_id"],
+        prompt_id=row["prompt_id"],
+        prompt_version=row["prompt_version"],
+        tier=Tier(row["tier"]),
+        model=row["model"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        cost=row["cost"],
+        latency_ms=row["latency_ms"],
+        status=AgentRunStatus(row["status"]),
+        error=row["error"],
+        retry_count=row["retry_count"],
+        created_at=row["created_at"],
     )
 
 

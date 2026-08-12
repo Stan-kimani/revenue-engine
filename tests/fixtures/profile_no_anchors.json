@@ -1,0 +1,21 @@
+{
+  "company_enrichment": {
+    "industry": {"value": null, "confidence": 0.1, "evidence": ""},
+    "sub_industry": {"value": null, "confidence": 0.1, "evidence": ""},
+    "business_model": {"value": null, "confidence": 0.1, "evidence": ""},
+    "employee_band": {"value": null, "confidence": 0.1, "evidence": ""},
+    "revenue_signal": {"value": "unknown", "confidence": 0.2, "evidence": ""},
+    "positioning_summary": {"value": null, "confidence": 0.1, "evidence": ""},
+    "tech_signals": [],
+    "insufficient_context": true
+  },
+  "contact_enrichment": {
+    "seniority": {"value": "unknown", "confidence": 0.1, "evidence": ""},
+    "decision_authority": {"value": null, "confidence": 0.1, "evidence": ""},
+    "functional_area": {"value": null, "confidence": 0.1, "evidence": ""},
+    "likely_responsibilities": [],
+    "inferred_pains": [],
+    "insufficient_context": true
+  },
+  "raw_research": "No usable public information was found for this company or contact beyond a name and a domain. No website content, no LinkedIn data, no press coverage, no job postings."
+}

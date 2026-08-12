@@ -1,0 +1,9 @@
+{
+  "company_name": "Meridian Ops",
+  "domain": "meridianops.example",
+  "raw_research": "No website content could be retrieved for this domain. No LinkedIn company page was found. No press coverage, job postings, or other public information is available beyond the company name and domain.",
+  "industry_pack_vocabulary": {
+    "say": ["capacity", "follow-up", "intake", "handoff", "response time", "without hiring", "system of record"],
+    "avoid": ["AI transformation", "digital transformation", "revolutionise / game-changing / cutting-edge", "leverage (as a verb)", "solutions (as a noun for what we sell)", "synergy", "unlock / supercharge / 10x"]
+  }
+}

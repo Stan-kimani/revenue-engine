@@ -98,6 +98,17 @@ class JobStatus(StrEnum):
     DEAD_LETTER = "dead_letter"
 
 
+class AgentRunStatus(StrEnum):
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class Tier(StrEnum):
+    FAST = "fast"
+    STANDARD = "standard"
+    DEEP = "deep"
+
+
 class Company(BaseModel):
     id: UUID
     name: str
@@ -213,3 +224,26 @@ class Job(BaseModel):
     last_error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class AgentRun(BaseModel):
+    """One core/llm.py::complete_json() call (M0.4). Written on both success
+    and failure — see docs/decisions.md for why this table's columns extend
+    beyond build-spec §5.1's original locked shape."""
+
+    id: UUID
+    agent: str
+    trigger_event: UUID | None
+    trace_id: str | None
+    prompt_id: str
+    prompt_version: int
+    tier: Tier
+    model: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cost: Decimal | None
+    latency_ms: int | None
+    status: AgentRunStatus
+    error: str | None
+    retry_count: int
+    created_at: datetime

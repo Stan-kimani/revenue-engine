@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://revenue-engine.internal/schemas/entities/industry_pack.json",
+  "title": "industry_pack",
+  "description": "Shape of a config/industries/*.yaml file (CLAUDE.md §1 non-negotiable 9: no vertical is hardcoded — this is the contract core/config.py validates every pack against before boot). Derived from the first real pack, config/industries/b2b-service-firms.yaml. Cross-field checks JSON Schema cannot express — scoring.weights summing to 1.0, objections.categories matching the reply_classification/objection_response enums — are asserted in core/config.py, not here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "version",
+    "status",
+    "icp",
+    "scoring",
+    "qualification",
+    "voice",
+    "commercial_boundaries",
+    "objections",
+    "sequences",
+    "service_catalogue",
+    "discovery",
+    "channels",
+    "account_limits"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$",
+      "description": "Matches the filename stem, e.g. b2b-service-firms.yaml -> name: b2b-service-firms."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": ["draft", "active"],
+      "description": "draft packs must not be usable for campaign launch (enforced where campaigns land, not here)."
+    },
+    "base_currency_note": {
+      "type": "string"
+    },
+    "icp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "firmographics", "roles", "disqualifiers"],
+      "properties": {
+        "summary": { "type": "string" },
+        "firmographics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["business_models", "employee_bands", "revenue_signals", "geographies_preferred"],
+          "properties": {
+            "business_models": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "employee_bands": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "employee_bands_secondary": { "type": "array", "items": { "type": "string" } },
+            "revenue_signals": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "geographies_preferred": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          }
+        },
+        "roles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_titles", "seniority_weight"],
+          "properties": {
+            "target_titles": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "seniority_weight": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+            }
+          }
+        },
+        "disqualifiers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "rule", "reason"],
+            "properties": {
+              "id": { "type": "string" },
+              "rule": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "scoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["weights", "budget_fit_map", "bands", "min_confidence_to_store", "guidance"],
+      "properties": {
+        "weights": {
+          "type": "object",
+          "description": "Must sum to 1.0 +/- 0.001 - asserted in core/config.py, not expressible here.",
+          "minProperties": 1,
+          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "budget_fit_map": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "bands": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sql", "mql", "warm"],
+          "properties": {
+            "sql": { "type": "number" },
+            "mql": { "type": "number" },
+            "warm": { "type": "number" }
+          }
+        },
+        "min_confidence_to_store": { "type": "number", "minimum": 0, "maximum": 1 },
+        "guidance": {
+          "type": "string",
+          "description": "Rendered verbatim into qualification/score_lead.md as {{scoring_guidance}}."
+        }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["opportunity_score", "discovery_checklist"],
+      "properties": {
+        "opportunity_score": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dimensions", "scale", "threshold_to_scope", "require_all_above"],
+          "properties": {
+            "dimensions": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "type": "string" }
+            },
+            "scale": { "type": "string" },
+            "threshold_to_scope": { "type": "number" },
+            "require_all_above": { "type": "number" }
+          }
+        },
+        "discovery_checklist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "question", "fail_if", "reason"],
+            "properties": {
+              "id": { "type": "string" },
+              "question": { "type": "string" },
+              "fail_if": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "voice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sender_persona", "tone_rules", "vocabulary"],
+      "properties": {
+        "sender_persona": {
+          "type": "string",
+          "description": "Rendered into {{sender_persona}}."
+        },
+        "tone_rules": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "vocabulary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["say", "avoid"],
+          "properties": {
+            "say": { "type": "array", "items": { "type": "string" } },
+            "avoid": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "commercial_boundaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "published_range",
+        "never_state_autonomously",
+        "on_pricing_question",
+        "escalate_immediately_on"
+      ],
+      "properties": {
+        "published_range": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "statement"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "statement": { "type": "string" }
+          }
+        },
+        "never_state_autonomously": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "on_pricing_question": { "type": "string" },
+        "escalate_immediately_on": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      }
+    },
+    "objections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories"],
+      "properties": {
+        "categories": {
+          "type": "object",
+          "description": "Closed vocabulary. Keys must equal the objection_category enum (minus null) in both schemas/outputs/reply_classification.json and schemas/outputs/objection_response.json - asserted in core/config.py, not here.",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "sequences": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default", "reply_confidence_min"],
+      "properties": {
+        "default": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key", "steps"],
+          "properties": {
+            "key": { "type": "string" },
+            "steps": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["day", "prompt", "intent"],
+                "properties": {
+                  "day": { "type": "integer", "minimum": 0 },
+                  "prompt": { "type": "string" },
+                  "intent": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "reply_confidence_min": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "service_catalogue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry", "core", "ongoing", "pricing"],
+      "properties": {
+        "entry": { "$ref": "#/$defs/service_catalogue_entry" },
+        "core": { "$ref": "#/$defs/service_catalogue_entry" },
+        "ongoing": { "$ref": "#/$defs/service_catalogue_entry" },
+        "pricing": {
+          "const": "HUMAN_SET_ONLY",
+          "description": "The model never sets or infers a price (CLAUDE.md §1 non-negotiable 8)."
+        }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "replenish_floor",
+        "replenish_ceiling",
+        "max_per_run",
+        "credit_budget_per_week"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replenish_floor": { "type": "integer", "minimum": 0 },
+        "replenish_ceiling": { "type": "integer", "minimum": 0 },
+        "max_per_run": { "type": "integer", "minimum": 0 },
+        "credit_budget_per_week": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "channels": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "boolean" }
+    },
+    "account_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["single_thread_per_company"],
+      "properties": {
+        "single_thread_per_company": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "service_catalogue_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "outcome", "duration"],
+      "properties": {
+        "name": { "type": "string" },
+        "outcome": { "type": "string" },
+        "duration": { "type": "string" }
+      }
+    }
+  }
+}

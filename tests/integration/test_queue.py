@@ -12,6 +12,7 @@ import asyncpg
 import pytest
 
 from revenue_engine.core import queue as core_queue
+from revenue_engine.core.config import get_config
 from revenue_engine.db import repositories as repo
 from revenue_engine.db.models import JobStatus
 
@@ -32,7 +33,7 @@ async def conn(database_url: str):
 
 
 async def test_job_failing_max_attempts_dead_letters_and_emits_event(conn: asyncpg.Connection):
-    config = core_queue._load_config()
+    config = get_config().queue
     job = await repo.enqueue_job(conn, type="test.always_fails", payload={})
 
     result = job
@@ -76,7 +77,7 @@ async def test_stale_locked_job_is_reclaimed_after_visibility_timeout(conn: asyn
 async def test_stale_job_reclaimed_repeatedly_eventually_dead_letters(conn: asyncpg.Connection):
     """The bug Correction 2 fixed: a job whose worker keeps dying must
     eventually dead-letter, not be reclaimed forever with attempts stuck."""
-    config = core_queue._load_config()
+    config = get_config().queue
     job = await repo.enqueue_job(conn, type="test.chronically_stale", payload={})
 
     for _ in range(config.max_attempts):

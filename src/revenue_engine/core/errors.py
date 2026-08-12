@@ -55,3 +55,40 @@ class EventPayloadValidationError(RevenueEngineError):
         self.event_type = event_type
         self.errors = errors
         super().__init__(f"Invalid payload for event '{event_type}': {'; '.join(errors)}")
+
+
+class ConfigError(RevenueEngineError):
+    """Raised by core/config.py when config/base.yaml or the selected
+    industry pack fails to load or validate. A hard boot failure, not a
+    warning (CLAUDE.md §1 non-negotiable 9): a bad scoring-weight sum, a
+    pack that fails schemas/entities/industry_pack.json, or objection-category
+    drift between the pack and the two output schemas that reference it must
+    stop the process, not degrade silently."""
+
+
+class PromptRenderError(RevenueEngineError):
+    """Raised by core/llm.py when a prompt template references a
+    {{variable}} with no supplied value. Fails loudly before any API call —
+    never renders an empty string into a prompt (docs/phase1-llm-boundary.md)."""
+
+    def __init__(self, prompt_id: str, missing: list[str]) -> None:
+        self.prompt_id = prompt_id
+        self.missing = missing
+        super().__init__(
+            f"Prompt '{prompt_id}' references undefined variable(s): {', '.join(missing)}"
+        )
+
+
+class LLMValidationError(RevenueEngineError):
+    """Raised by core/llm.py::complete_json() when a model response still
+    fails schema or cross-field (V1-V9) validation after one retry. No
+    partial output is ever written — the caller gets this exception and
+    an `llm.validation_failed` event, nothing else."""
+
+    def __init__(self, prompt_id: str, prompt_version: int, errors: list[str]) -> None:
+        self.prompt_id = prompt_id
+        self.prompt_version = prompt_version
+        self.errors = errors
+        super().__init__(
+            f"'{prompt_id}' v{prompt_version} failed validation twice: {'; '.join(errors)}"
+        )

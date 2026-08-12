@@ -1,0 +1,9 @@
+{
+  "company_name": "Harbor & Voss Consulting",
+  "domain": "harborvoss.example",
+  "raw_research": "Harbor & Voss Consulting is a 34-person management consulting firm based in Austin, Texas, founded in 2014. Their website describes their work as 'operational diagnostics and process redesign for mid-market professional services firms' — clients include accounting practices, boutique law firms, and recruiting agencies. A LinkedIn post from three weeks ago announced they closed a $2.1M advisory engagement with a regional accounting network and are 'actively hiring two operations analysts to keep up with demand.' Their job postings mention 'HubSpot', 'Airtable', and 'manual client intake process that needs systemization' as current pain points. Revenue grew an estimated 40% year over year per a local business journal profile published two months ago, which also noted the firm has no dedicated ops or systems hire yet — the two founding partners still handle client intake personally.",
+  "industry_pack_vocabulary": {
+    "say": ["capacity", "follow-up", "intake", "handoff", "response time", "without hiring", "system of record"],
+    "avoid": ["AI transformation", "digital transformation", "revolutionise / game-changing / cutting-edge", "leverage (as a verb)", "solutions (as a noun for what we sell)", "synergy", "unlock / supercharge / 10x"]
+  }
+}

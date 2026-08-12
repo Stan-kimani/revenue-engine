@@ -12,6 +12,7 @@ dependencies = [
     "jsonschema>=4.22",
     "anthropic>=0.34",
     "python-dotenv>=1.0",
+    "langfuse>=2.0",
 ]
 
 [dependency-groups]
@@ -54,5 +55,5 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["asyncpg", "jsonschema", "yaml"]
+module = ["asyncpg", "jsonschema", "yaml", "langfuse", "langfuse.*"]
 ignore_missing_imports = true

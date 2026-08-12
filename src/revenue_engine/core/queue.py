@@ -20,50 +20,17 @@ function already is.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from functools import cache
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import asyncpg
-import yaml
 
 from ..db import repositories as repo
 from ..db.models import Event, Job, JobStatus
 from . import events as core_events
+from .config import QueueConfig, get_config
 from .errors import RevenueEngineError
-
-_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "base.yaml"
-
-
-@dataclass(frozen=True)
-class QueueConfig:
-    """TEMPORARY (docs/decisions.md): core/config.py does not exist until
-    M0.4. This is a minimal, module-local loader for exactly the four
-    queue.* keys this module needs — not a general config system, and not to
-    be extended for anything else. Replace with core/config.py's typed,
-    validated loader at M0.4; this class and `_load_config` should not
-    survive that migration unchanged.
-    """
-
-    max_attempts: int
-    backoff_base_s: float
-    backoff_cap_s: float
-    visibility_timeout_s: int
-
-
-@cache
-def _load_config() -> QueueConfig:
-    raw = yaml.safe_load(_CONFIG_PATH.read_text())
-    q = raw["queue"]
-    return QueueConfig(
-        max_attempts=q["max_attempts"],
-        backoff_base_s=q["backoff_base_s"],
-        backoff_cap_s=q["backoff_cap_s"],
-        visibility_timeout_s=q["visibility_timeout_s"],
-    )
 
 
 def _compute_backoff_s(attempts: int, config: QueueConfig) -> float:
@@ -149,7 +116,7 @@ async def fail(conn: asyncpg.Connection, job_id: UUID, *, error: str) -> Job:
     if job is None:
         raise RevenueEngineError(f"Job not found: {job_id}")
 
-    config = _load_config()
+    config = get_config().queue
     next_attempts = job.attempts + 1
 
     if next_attempts >= config.max_attempts:
@@ -171,7 +138,7 @@ async def reclaim_stale(conn: asyncpg.Connection) -> list[Job]:
     to emit `job.dead_lettered` for whichever ones did, since the repository
     layer never emits events (CLAUDE.md separation).
     """
-    config = _load_config()
+    config = get_config().queue
     reclaimed = await repo.reclaim_stale_jobs(
         conn,
         visibility_timeout_s=config.visibility_timeout_s,
