@@ -1157,3 +1157,65 @@ See the M0.4 verification report (chat) for the full §7 write-up: real command
 output, `git diff --stat HEAD -- tests/`, iteration/triage log, and the NOT
 VERIFIED section (golden tests were built but not executed — no
 `ANTHROPIC_API_KEY` in this environment).
+
+## 2026-08-12 — config/base.yaml: model-ID pinning and pricing re-verified pre-M1.1
+
+**Context:** two corrections requested before M1.1, both about `config/base.yaml`'s
+`models` block, on the stated concern that a silently-changing model ID or a wrong
+cost figure would corrupt the Learning Agent's cross-time messaging comparisons
+and `agent_runs` cost tracking.
+
+**1. Tier pinning.** The premise — that `standard` (`claude-sonnet-5`) and `deep`
+(`claude-opus-5`) "appear to use undated aliases" the way `fast` doesn't — turned
+out not to hold, checked directly against Anthropic's model-ID documentation
+rather than assumed either way:
+[https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions),
+fetched 2026-08-12. Quoting it directly: *"Starting with the Claude 4.6
+generation, model IDs use a dateless format... For the 4.6 generation and later,
+the dateless ID is the canonical model ID for that release. It maps to a single,
+fixed model snapshot... A 4.6-generation ID such as `claude-sonnet-4-6` is not an
+alias. It is the snapshot."* The doc names this exact assumption — that a
+dateless ID behaves like an evergreen alias — as *"a common misconception."*
+There is no separate dated-snapshot form of `claude-sonnet-5` or `claude-opus-5`
+documented anywhere (the model overview table's "Claude API ID" and "Claude API
+alias" columns are literally identical strings for both), so there is nothing to
+pin to instead — inventing a fake dated ID would be actively wrong, not more
+correct. `fast` (`claude-haiku-4-5-20251001`) was already the true dated
+snapshot for its pre-4.6 generation, not the `claude-haiku-4-5` alias.
+**Conclusion: all three tier→model IDs in `config/base.yaml` were already
+maximally and permanently pinned. No model ID changed.** The underlying goal
+(no silent model swap under a fixed tier) is satisfied by the current
+identifiers as-is.
+
+**2. Pricing.** Re-verified against
+[https://platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing),
+also fetched 2026-08-12, cross-checked against the models-overview table
+fetched the same day:
+
+| Tier | Model | Input $/MTok | Output $/MTok |
+|---|---|---|---|
+| fast | claude-haiku-4-5-20251001 | 1 | 5 |
+| standard | claude-sonnet-5 | **2** | **10** |
+| deep | claude-opus-5 | 5 | 25 |
+
+`fast` and `deep` were already correct — unchanged. `standard` was wrong:
+M0.4 deliberately set it to $3/$15, the *post-introductory* rate, as a hedge
+against a scheduled September 1, 2026 price increase from the $2/$10
+introductory rate. Anthropic's pricing page now states, verbatim: *"The $2/$10
+per million input/output token pricing for Claude Sonnet 5, announced at launch
+as introductory pricing through August 31, 2026, is now the standard price. The
+previously scheduled increase to $3/$15 per million input/output tokens on
+September 1, 2026 will not occur."* The hedge is stale; updated `standard` to
+$2/$10, the confirmed-permanent rate. This was actively wrong in the direction
+of overcounting cost for every `standard`-tier `agent_runs` row recorded since
+M0.4 landed — worth noting since `deep` (Opus-class, used by the Learning Agent
+over large evidence sets per this instruction) was correct throughout and never
+had this problem.
+
+**Verification:** `config/base.yaml`'s comment block rewritten to cite both
+sources and the 2026-08-12 date directly (not just referenced here). No test
+asserts a literal cost figure (`tests/unit/test_config.py`'s cost test compares
+against the config's own configured rates, not hardcoded numbers), so no test
+changes were needed. `ruff check`, `ruff format --check`, `mypy --strict` on
+`core/`/`db/`, and the full `tests/unit tests/contracts tests/integration` suite
+(190 tests) all re-run clean after the change.

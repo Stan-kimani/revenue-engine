@@ -11,12 +11,27 @@ queue:
 # Tier -> Claude API model ID (build-spec §6: "Never hardcode a model name in
 # a prompt file"). A prompt's frontmatter names a tier, never a model — core/llm.py
 # resolves the mapping here so switching models is a one-line config edit.
-# Model IDs and $/MTok pricing verified against
-# https://platform.claude.com/docs/en/about-claude/models on 2026-08-10.
-# Note: Sonnet 5 has introductory pricing ($2/$10 per MTok) through 2026-08-31;
-# cost_per_mtok below uses the standard post-introductory rate ($3/$15)
-# deliberately, so recorded agent_runs.cost doesn't silently jump on Sept 1 —
-# see docs/decisions.md.
+#
+# All three model IDs are permanently pinned snapshots, re-verified against
+# https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions
+# and https://platform.claude.com/docs/en/about-claude/pricing on 2026-08-12 —
+# see docs/decisions.md for the full verification note, including why
+# `claude-sonnet-5` / `claude-opus-5` (dateless) are NOT aliases despite
+# looking like ones: for the Claude 4.6+ generation, the dateless ID IS the
+# canonical pinned snapshot ("A 4.6-generation ID such as claude-sonnet-4-6 is
+# not an alias. It is the snapshot." — Anthropic's own docs name this exact
+# assumption as a common misconception). There is no separate dated form to
+# pin to for Sonnet 5 or Opus 5. `claude-haiku-4-5-20251001` (pre-4.6
+# generation) is the actual dated snapshot; `claude-haiku-4-5` (no date) would
+# be the convenience alias — deliberately not used here.
+#
+# $/MTok pricing confirmed current (not introductory-and-about-to-change) on
+# 2026-08-12: Anthropic's pricing page now states the Sonnet 5 introductory
+# rate ($2/$10) "is now the standard price" and the previously scheduled
+# September 1, 2026 increase to $3/$15 "will not occur" — the prior entry
+# here used $3/$15 as a deliberate hedge against that scheduled increase;
+# that hedge is now stale and has been removed in favour of the actual,
+# confirmed-permanent rate.
 models:
   fast:
     model: claude-haiku-4-5-20251001
@@ -24,8 +39,8 @@ models:
     output_cost_per_mtok: 5
   standard:
     model: claude-sonnet-5
-    input_cost_per_mtok: 3
-    output_cost_per_mtok: 15
+    input_cost_per_mtok: 2
+    output_cost_per_mtok: 10
   deep:
     model: claude-opus-5
     input_cost_per_mtok: 5
