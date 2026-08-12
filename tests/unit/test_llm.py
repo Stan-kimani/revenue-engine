@@ -15,6 +15,9 @@ Postgres write is exactly what tests/integration/ is for.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from revenue_engine.core import llm
@@ -71,11 +74,14 @@ def test_strip_code_fence_leaves_unfenced_text_alone():
 
 
 # ---------------------------------------------------------------------------
-# Structured-output schema transform (docs/decisions.md, 2026-08-13): the
-# Anthropic structured-output API rejects/mishandles a JSON Schema `enum`
-# that includes `null` — the documented fix is `anyOf` with a `{"type":
-# "null"}` branch. Every other unsupported keyword is stripped by the SDK
-# itself, not by this function.
+# Structured-output schema transform (docs/decisions.md, 2026-08-13 and
+# 2026-08-14 entries). Two things the Anthropic structured-output API
+# rejects with a 400 if present: a JSON Schema `enum` that includes `null`
+# (fixed via `anyOf` with a `{"type": "null"}` branch), and a fixed set of
+# numeric/string/array bounding keywords (`minimum`, `maximum`, `maxItems`,
+# `maxLength`, ... — confirmed by a real 400 response, not assumed from
+# docs). Both are stripped from a derived request-only copy; the on-disk
+# schemas/outputs/*.json keeps every constraint, unchanged.
 # ---------------------------------------------------------------------------
 
 
@@ -110,6 +116,83 @@ def test_structured_output_schema_recurses_into_array_items():
     schema = {"type": "array", "items": {"enum": ["a", None]}}
     transformed = llm._to_structured_output_schema(schema)
     assert "anyOf" in transformed["items"]
+
+
+def test_structured_output_schema_strips_unsupported_bounding_keywords():
+    """Regression guard for the real 400 the API returned when these were
+    left in place: 'For 'number' type, properties maximum, minimum are not
+    supported' / 'For 'array' type, property 'maxItems' is not supported'
+    (docs/decisions.md, 2026-08-14)."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "tags": {"type": "array", "maxItems": 5, "minItems": 0, "items": {"type": "string"}},
+            "note": {"type": "string", "minLength": 1, "maxLength": 100, "pattern": "^[a-z]+$"},
+            "when": {"type": "string", "format": "date"},
+            "count": {"type": "integer", "multipleOf": 2},
+        },
+    }
+    transformed = llm._to_structured_output_schema(schema)
+    found = _find_keys(transformed, llm._STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS)
+    assert not found, f"unsupported keyword(s) survived transform: {found}"
+    # the shape itself must survive untouched
+    assert transformed["properties"]["confidence"]["type"] == "number"
+    assert transformed["properties"]["tags"]["items"] == {"type": "string"}
+
+
+def _find_keys(node: object, keys: frozenset[str] | set[str]) -> set[str]:
+    """Recursively collects every dict key in `node` that appears in `keys`
+    — used to assert an unsupported keyword is (or isn't) present anywhere
+    in a schema, not just at the top level."""
+    found: set[str] = set()
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in keys:
+                found.add(k)
+            found |= _find_keys(v, keys)
+    elif isinstance(node, list):
+        for item in node:
+            found |= _find_keys(item, keys)
+    return found
+
+
+_OUTPUT_SCHEMA_FILES = sorted((llm._SCHEMAS_DIR / "outputs").glob("*.json"))
+
+
+@pytest.mark.parametrize("schema_path", _OUTPUT_SCHEMA_FILES, ids=lambda p: p.name)
+def test_every_real_output_schema_has_no_unsupported_keyword_after_transform(
+    schema_path: Path,
+):
+    """Walks the request-side copy actually built for all 9 real output
+    schemas, not a hand-built fixture — the class of check whose absence let
+    the original bug (400s from the live API) ship."""
+    raw = json.loads(schema_path.read_text())
+    transformed = llm._to_structured_output_schema(raw)
+    found = _find_keys(transformed, llm._STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS)
+    assert not found, f"{schema_path.name}: unsupported keyword(s) survived transform: {found}"
+
+
+@pytest.mark.protected
+@pytest.mark.parametrize("schema_path", _OUTPUT_SCHEMA_FILES, ids=lambda p: p.name)
+def test_on_disk_output_schemas_still_enforce_their_bounds(schema_path: Path):
+    """Proves the strip in _to_structured_output_schema() operates on a
+    derived copy, never the source: every one of the 9 real output schemas
+    keeps at least one of its bounding keywords on disk, unmodified — these
+    are real correctness rules (confidence in [0, 1], maxItems on an anchors
+    array, maxLength on a body) that post-call jsonschema validation must
+    keep enforcing regardless of what the structured-output request omits."""
+    raw = json.loads(schema_path.read_text())
+    found = _find_keys(raw, {"minimum", "maximum", "maxLength", "maxItems"})
+    assert found, f"{schema_path.name}: expected at least one bounding keyword on disk"
+
+
+def test_transform_does_not_mutate_the_loaded_schema_in_place():
+    raw = llm._load_output_schema("outputs/reply_classification.json")
+    before = json.dumps(raw, sort_keys=True)
+    llm._to_structured_output_schema(raw)
+    after = json.dumps(raw, sort_keys=True)
+    assert before == after
 
 
 @pytest.mark.protected

@@ -188,6 +188,76 @@ async def test_request_sent_to_model_includes_the_output_schema(conn: asyncpg.Co
     assert "enum" not in category
     assert {"type": "null"} in category["anyOf"]
 
+    # Round 2 of this bug (docs/decisions.md, 2026-08-14): the API also
+    # rejects a fixed set of bounding keywords outright with a 400
+    # ("For 'number' type, properties maximum, minimum are not supported").
+    # None of them may survive anywhere in what's actually sent.
+    unsupported = _find_unsupported_keywords(sent_schema)
+    assert not unsupported, f"unsupported keyword(s) sent to the API: {unsupported}"
+    # confidence's 0..1 bound is real in the schema on disk -- prove it's
+    # actually one of the keywords being stripped, not just that the stub
+    # happens not to trip over an empty set.
+    on_disk = llm._load_output_schema("outputs/reply_classification.json")
+    assert "maximum" in json.dumps(on_disk)
+
+
+def _find_unsupported_keywords(node: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in llm._STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS:
+                found.add(key)
+            found |= _find_unsupported_keywords(value)
+    elif isinstance(node, list):
+        for item in node:
+            found |= _find_unsupported_keywords(item)
+    return found
+
+
+@pytest.mark.protected
+async def test_confidence_out_of_bounds_is_still_rejected_after_structured_output_strip(
+    conn: asyncpg.Connection,
+):
+    """Structured outputs enforces shape and enum membership only -- the
+    request-side schema has its `minimum`/`maximum` bound on `confidence`
+    stripped (the API 400s otherwise). This proves the bound still survives
+    via post-call jsonschema validation against the untouched on-disk
+    schema: an out-of-range confidence must still be rejected, retried, and
+    ultimately raise -- the retry/validation path is not dead code just
+    because structured outputs exists."""
+    out_of_bounds = json.dumps(
+        {
+            "intent": "objection",
+            "confidence": 1.5,  # schema bounds this to [0, 1] -- stripped from the request
+            "reasoning": "Prospect raised a price concern directly.",
+            "objection_category": "price",
+            "escalation_signals": [],
+            "suggested_action": "send_followup",
+        }
+    )
+    client = _StubClient([out_of_bounds, out_of_bounds])
+    correlation_id = uuid.uuid4()
+    trace = TraceContext(trace_id="t-bounds", correlation_id=correlation_id)
+
+    with pytest.raises(LLMValidationError) as exc_info:
+        await llm.complete_json(
+            "sales/classify_reply.md",
+            _classify_reply_variables(),
+            "outputs/reply_classification.json",
+            trace,
+            conn=conn,
+            correlation_id=correlation_id,
+            actor="test",
+            client=client,
+        )
+
+    assert len(client.messages.calls) == 2  # retried once, then gave up -- not silently accepted
+    assert any("1.5" in e or "maximum" in e.lower() for e in exc_info.value.errors)
+
+    row = await _agent_run_for(conn, "sales/classify_reply")
+    assert row is not None
+    assert row["status"] == AgentRunStatus.FAILED.value
+
 
 @pytest.mark.protected
 async def test_retries_exactly_once_on_schema_invalid_response_then_succeeds(

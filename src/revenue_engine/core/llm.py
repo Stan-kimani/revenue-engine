@@ -11,12 +11,18 @@ a second failure raises `LLMValidationError` and emits `llm.validation_failed`
 with nothing partial written. Every call — success or failure — is recorded
 to `agent_runs` and traced through core/observability.py.
 
-Structured outputs (docs/decisions.md, 2026-08-13 entry): the model is never
-shown only prose describing the schema — it is constrained to it directly, so
-the class of bug where a model invents a plausible-but-wrong enum value or
-field name is prevented at generation time, not just caught after the fact.
-`schemas/outputs/*.json` remains the single source of truth; prompt bodies
-must never duplicate the schema in prose (prompts/_conventions.md).
+Structured outputs (docs/decisions.md, 2026-08-13/2026-08-14 entries): the
+model is never shown only prose describing the schema — it is constrained to
+it directly, so the class of bug where a model invents a plausible-but-wrong
+enum value or field name is prevented at generation time, not just caught
+after the fact. `schemas/outputs/*.json` remains the single source of truth;
+prompt bodies must never duplicate the schema in prose (prompts/_conventions.md).
+Structured outputs enforces shape and enum membership *only* — the API
+itself rejects numeric/length/pattern bounds if present in the request
+schema (`_STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS`), so this module's own
+post-call jsonschema validation is still the only thing enforcing `minimum`/
+`maximum`/`maxLength`/`pattern`/etc., and the V1-V9 + retry path is very much
+still live, not dead code superseded by this feature.
 
 No prompt text lives here (CLAUDE.md §1 non-negotiable 3) — this module only
 parses and renders prompt *files*; the words themselves are all under
@@ -215,27 +221,75 @@ def _load_output_validator(output_schema: str) -> jsonschema.Draft202012Validato
     return jsonschema.Draft202012Validator(_load_output_schema(output_schema))
 
 
+# Keywords the Anthropic structured-output API rejects outright with a 400 if
+# present anywhere in output_config.format.schema. Confirmed by a real 400
+# response, not inferred from docs alone — an earlier version of this
+# function trusted the docs' claim that the SDK "automatically strips
+# unsupported constraints" and shipped with none of these stripped; the
+# actual API call returned:
+#   "output_config.format.schema: For 'number' type, properties maximum,
+#    minimum are not supported"
+#   "output_config.format.schema: For 'array' type, property 'maxItems' is
+#    not supported"
+# — proving that claim doesn't hold for a raw dict passed via output_config
+# (whatever automatic transformation the docs describe evidently applies to
+# some other call path). See docs/decisions.md, 2026-08-14 correction.
+# Deliberately conservative: every numeric/string/array bounding keyword
+# encountered in this codebase's schemas, plus documented neighbours not
+# currently in use (exclusiveMinimum/Maximum, multipleOf, uniqueItems) —
+# a keyword this module doesn't yet use but a future schema adds is still
+# covered without needing to remember to extend this list.
+_STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS = frozenset(
+    {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "format",
+        "uniqueItems",
+    }
+)
+
+
 def _to_structured_output_schema(node: Any) -> Any:
     """Transform for the Anthropic structured-output API
     (`output_config.format.schema`, https://platform.claude.com/docs/en/
-    build-with-claude/structured-outputs, verified 2026-08-13). Only one
-    transform is applied: a JSON Schema `enum` that includes `null` is
-    explicitly unsupported there ("use anyOf with {"type": "null"} instead")
-    and several of schemas/outputs/*.json use exactly that pattern for
-    inferred-value fields (e.g. company_enrichment.json's `business_model`,
-    contact_enrichment.json's `seniority`, reply_classification.json's
-    `objection_category`). Every other unsupported keyword (minLength,
-    maxLength, minimum, maximum, ...) is silently stripped by the installed
-    Anthropic SDK itself before the request is sent — not re-implemented
-    here, since duplicating that logic would drift from the SDK's own
-    behaviour. `schemas/outputs/*.json` is untouched by this function; it is
-    still what `_validate_json_response` checks the response against — this
-    transform only affects what the model is constrained to while
-    generating, never what this module accepts afterward.
+    build-with-claude/structured-outputs, verified 2026-08-13, corrected
+    2026-08-14 after a real 400 response). Two transforms, applied
+    recursively:
+
+    1. Every key in `_STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS` is dropped —
+       the API rejects the request outright if present.
+    2. A JSON Schema `enum` that includes `null` is rewritten as `anyOf`
+       with a `{"type": "null"}` branch — also explicitly unsupported
+       ("use anyOf with {"type": "null"} instead"), and several of
+       schemas/outputs/*.json use exactly that pattern for inferred-value
+       fields (e.g. company_enrichment.json's `business_model`,
+       contact_enrichment.json's `seniority`, reply_classification.json's
+       `objection_category`).
+
+    CRITICAL: `schemas/outputs/*.json` is never touched by this function —
+    it always operates on a derived, in-memory copy. `_load_output_schema`'s
+    return value (and therefore `_load_output_validator` and
+    `_validate_json_response`) keeps every constraint this function strips.
+    Structured outputs guarantees shape and enum membership at generation
+    time; every bound (`confidence` in [0, 1], `maxItems` on
+    `personalization_anchors`, `maxLength` on an outreach body, `pattern` on
+    an `anchor_id`, ...) is enforced *only* by this module's own post-call
+    jsonschema validation, same as before this feature existed — the retry
+    path is very much still live for those failures, not dead code.
     """
     if isinstance(node, dict):
         result: dict[str, Any] = {}
         for key, value in node.items():
+            if key in _STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS:
+                continue
             if key == "enum" and isinstance(value, list) and None in value:
                 result["anyOf"] = [
                     {"enum": [v for v in value if v is not None]},

@@ -1327,3 +1327,78 @@ inspection, which is exactly the test doing its job. `make golden` output
 (with a real `ANTHROPIC_API_KEY` if available in this session, or the honest
 absence of one if not) is reported separately in chat, per the instruction not
 to fabricate results.
+
+## 2026-08-14 — Correction: structured outputs also rejects bounding keywords, not just null-enums
+
+**Context:** the 2026-08-13 entry above stated, based on reading
+https://platform.claude.com/docs/en/build-with-claude/structured-outputs, that
+"length/numeric constraints... are silently stripped by the SDK itself before
+the request is sent." **That was wrong.** Running `make golden` for real
+produced 400 errors directly from the API:
+
+```
+output_config.format.schema: For 'number' type, properties maximum, minimum are not supported
+output_config.format.schema: For 'array' type, property 'maxItems' is not supported
+```
+
+Re-fetching the same docs page a second time produced a materially different
+account of which keywords are supported than the first fetch did (the first
+said basic regex `pattern` was supported; a later fetch listed `pattern` as
+unsupported) — the page's content, or WebFetch's summarisation of it, is not
+stable enough to treat as authoritative on its own. **The real 400 response is
+the ground truth here, not any single doc fetch.** Passing a raw dict via
+`output_config` evidently bypasses whatever automatic constraint-stripping the
+SDK's higher-level helpers may do for other call shapes — this module builds
+the dict directly, so nothing was actually being stripped before the request
+went out.
+
+**Fix:** `core/llm.py::_STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS` — a hardcoded,
+deliberately conservative set, stripped by `_to_structured_output_schema()`
+alongside the existing enum-null transform: `minimum`, `maximum`,
+`exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minItems`, `maxItems`,
+`minLength`, `maxLength`, `pattern`, `format`, `uniqueItems`. Covers both
+keywords from the actual observed 400s and documented neighbours in the same
+family not currently triggering an error (`exclusiveMinimum`/`Maximum`,
+`multipleOf`, `uniqueItems` — none of our schemas use these today, but a
+future schema might, and the strip needs to not depend on remembering to
+extend a list at that point either — it's already comprehensive). Checked
+which of these actually appear in `schemas/outputs/*.json`: `minimum` and
+`maximum` in all 9 (every confidence-style field is bounded 0..1), `maxLength`
+in all 9, `maxItems` in all 9, `pattern` in 3 (`anchor_id` references),
+`minLength` in 2, `format` in 1, `minItems` in 1 — confirming this wasn't a
+narrow, easily-missed edge case; it would have broken every one of the 10
+prompts' real calls.
+
+**CRITICAL, verified not just asserted:** `_to_structured_output_schema()`
+only ever operates on a value returned from `json.loads`/dict-comprehension —
+never mutates its input in place (`test_transform_does_not_mutate_the_loaded_schema_in_place`
+proves this against the actual cached `_load_output_schema` return value, not
+a fresh copy). `schemas/outputs/*.json` on disk, and what
+`_validate_json_response()` checks the response against, keeps every
+constraint stripped from the request. `test_confidence_out_of_bounds_is_still_rejected_after_structured_output_strip`
+proves this isn't just true in principle: a stubbed response with
+`confidence: 1.5` (schema bounds it to `[0, 1]`) is still retried once and
+then still raises `LLMValidationError` — the bound and the retry path both
+still function exactly as before this feature existed.
+
+**Tests, per your explicit instructions:**
+- `tests/unit/test_llm.py::test_every_real_output_schema_has_no_unsupported_keyword_after_transform`
+  — parametrized across all 9 real `schemas/outputs/*.json` files, asserts
+  the transformed (request-side) copy has none of
+  `_STRUCTURED_OUTPUT_UNSUPPORTED_KEYWORDS` anywhere in the tree.
+- `tests/unit/test_llm.py::test_on_disk_output_schemas_still_enforce_their_bounds`
+  (protected) — parametrized across the same 9 files, asserts the *on-disk*
+  schema still has at least one bounding keyword — proving the strip targets
+  a copy, not the source.
+- `tests/integration/test_complete_json.py::test_request_sent_to_model_includes_the_output_schema`
+  extended to also assert no unsupported keyword survives in what's actually
+  sent to the stubbed client, and that the on-disk schema still has
+  `maximum`.
+- `tests/integration/test_complete_json.py::test_confidence_out_of_bounds_is_still_rejected_after_structured_output_strip`
+  (protected) — the stubbed-client bound-survival test described above.
+
+**Verification:** `ruff check`, `ruff format --check`, `mypy --strict` on
+`core/`/`db/`, and the full suite (218 tests now, 40 protected) all pass
+against a disposable Postgres instance, torn down after. Not re-run against
+the live API in this environment (no `ANTHROPIC_API_KEY` here) — you're
+re-running `make golden` yourself, which is the real test of this fix.
