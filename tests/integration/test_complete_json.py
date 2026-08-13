@@ -337,7 +337,13 @@ async def test_raises_and_writes_nothing_partial_after_two_consecutive_failures(
     assert len(events) == 1
     payload = json.loads(events[0]["payload"])
     assert payload["prompt_id"] == "sales/classify_reply"
-    assert payload["prompt_version"] == 1
+    # Version-agnostic by design: the point of this assertion is that the event
+    # records the version actually used (what makes prompt-version performance
+    # comparison possible), not that the prompt is pinned at some literal
+    # version. Read the version straight from the prompt's own frontmatter
+    # rather than hardcoding it, so a future prompt-version bump can't silently
+    # turn this into a stale assertion again.
+    assert payload["prompt_version"] == llm._load_prompt("sales/classify_reply.md").version
     assert payload["run_id"] == str(runs[0]["id"])
     assert payload["errors"]
 

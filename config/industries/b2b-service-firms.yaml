@@ -201,7 +201,12 @@ commercial_boundaries:
 # ---------------------------------------------------------------------------
 objections:
   categories:
-    price:      "Cost, budget, or perceived expense."
+    price:      >-
+      Cost-vs-value dispute — it costs more than it is worth to them, more
+      than alternatives, they cannot justify it. Do not use for a budget-timing
+      deferral (no budget this period, next fiscal year, mid-something-else)
+      where the price itself is not disputed — that is intent: not_now, not an
+      objection. See prompts/sales/classify_reply.md rule 8.
     timing:     "Not now, busy season, next quarter, mid-migration."
     trust:      "Unproven, no case studies in our industry, who are you."
     need:       "We already handle this, or we don't see the problem."
