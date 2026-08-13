@@ -86,10 +86,16 @@ class AnthropicClientProtocol(Protocol):
 @cache
 def _default_anthropic_client() -> AnthropicClientProtocol:
     """Reads ANTHROPIC_API_KEY from the environment (the SDK's own default).
+    Applies llm.timeout_s and llm.max_client_retries from config/base.yaml so
+    requests time out cleanly instead of hanging, and transient transport
+    failures are retried without burning a validation-retry slot in agent_runs.
     Only ever called when no `client` is injected — every unit/contract test
-    injects a stub and never reaches this, per your instruction that those
-    tests must not require an API key."""
-    return anthropic.AsyncAnthropic()
+    injects a stub and never reaches this path."""
+    cfg = get_config()
+    return anthropic.AsyncAnthropic(
+        timeout=cfg.llm.timeout_s,
+        max_retries=cfg.llm.max_client_retries,
+    )
 
 
 def _extract_text(response: Any) -> str:

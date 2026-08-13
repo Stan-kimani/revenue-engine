@@ -1530,3 +1530,29 @@ The V7 cross-field check (`objection_category` non-null only when
 `intent==not_now`) are the code-level guards that enforce the invariants these
 fixtures exercise.
 
+## 2026-08-13 — Explicit timeout and retry policy on AsyncAnthropic client
+
+**Context:** Three API timeouts occurred across three golden runs. The
+`AsyncAnthropic()` client was constructed with no `timeout` argument, so requests
+that hung (network stall, model delay) blocked the worker indefinitely rather
+than failing cleanly.
+
+**Decision:** Added `llm.timeout_s` (60 s) and `llm.max_client_retries` (2) to
+`config/base.yaml`. `_default_anthropic_client()` in `core/llm.py` now reads both
+from `get_config().llm` and passes them to `AsyncAnthropic(timeout=...,
+max_retries=...)`. A hung request now raises `httpx.ReadTimeout` after 60 s,
+which propagates as a job failure rather than a silent hang.
+
+**SDK transport retries are distinct from `complete_json`'s validation retry and
+must not inflate `retry_count` in `agent_runs`.** The SDK transport retries —
+triggered by network errors, 429 rate-limit responses, or 5xx server errors —
+happen transparently inside a single `await client.messages.create()` call and
+are completely invisible to `complete_json`'s `attempt` counter. `agent_runs.retry_count`
+= `attempt - 1` where `attempt` counts only validation-level retries (JSON schema
+failures and V1-V9 cross-field failures). A call that succeeds on the second
+validation attempt (`retry_count=1`) may have made up to `max_client_retries + 1`
+transport-level attempts *per* validation attempt; the `retry_count=1` in
+`agent_runs` still correctly represents one validation retry, not the total number
+of network round-trips. The Learning Agent's analysis of `agent_runs.retry_count`
+must treat it as measuring schema/validation re-drafts only.
+

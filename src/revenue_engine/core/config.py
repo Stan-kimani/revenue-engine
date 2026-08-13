@@ -63,6 +63,12 @@ class QueueConfig:
 
 
 @dataclass(frozen=True)
+class LLMConfig:
+    timeout_s: float
+    max_client_retries: int
+
+
+@dataclass(frozen=True)
 class ModelTierConfig:
     model: str
     input_cost_per_mtok: Decimal
@@ -136,6 +142,7 @@ class IndustryPack:
 @dataclass(frozen=True)
 class Config:
     queue: QueueConfig
+    llm: LLMConfig
     models: MappingProxyType[Tier, ModelTierConfig]
     pack: IndustryPack
 
@@ -180,6 +187,7 @@ def load_config(
     raw_base = yaml.safe_load(base_config_path.read_text())
 
     queue_cfg = _parse_queue(raw_base, base_config_path)
+    llm_cfg = _parse_llm(raw_base, base_config_path)
     models_cfg = _parse_models(raw_base, base_config_path)
 
     pack_name = (
@@ -199,7 +207,7 @@ def load_config(
     )
 
     pack = _parse_pack(raw_pack)
-    return Config(queue=queue_cfg, models=models_cfg, pack=pack)
+    return Config(queue=queue_cfg, llm=llm_cfg, models=models_cfg, pack=pack)
 
 
 @cache
@@ -226,6 +234,17 @@ def _parse_queue(raw_base: dict[str, Any], base_config_path: Path) -> QueueConfi
         )
     except (KeyError, TypeError) as exc:
         raise ConfigError(f"{base_config_path}: missing or malformed 'queue' block: {exc}") from exc
+
+
+def _parse_llm(raw_base: dict[str, Any], base_config_path: Path) -> LLMConfig:
+    try:
+        block = raw_base["llm"]
+        return LLMConfig(
+            timeout_s=float(block["timeout_s"]),
+            max_client_retries=int(block["max_client_retries"]),
+        )
+    except (KeyError, TypeError) as exc:
+        raise ConfigError(f"{base_config_path}: missing or malformed 'llm' block: {exc}") from exc
 
 
 def _parse_models(

@@ -32,6 +32,21 @@ queue:
 # here used $3/$15 as a deliberate hedge against that scheduled increase;
 # that hedge is now stale and has been removed in favour of the actual,
 # confirmed-permanent rate.
+# SDK transport-layer settings for the AsyncAnthropic client (core/llm.py).
+# These are distinct from complete_json()'s own validation retry (_MAX_ATTEMPTS=2):
+#   - timeout_s: maximum seconds to wait for a single API response. A hung
+#     request raises httpx.ReadTimeout, which propagates up as a transport
+#     error rather than a silent hang.
+#   - max_client_retries: number of times the SDK will transparently re-send a
+#     request on transient transport failures (network errors, 429 rate limits,
+#     5xx). These happen inside a single `await client.messages.create()` call
+#     and are invisible to complete_json()'s `attempt` counter — they must
+#     never be confused with the validation-level retries recorded in
+#     agent_runs.retry_count. See docs/decisions.md, 2026-08-13 entry.
+llm:
+  timeout_s: 60
+  max_client_retries: 2
+
 models:
   fast:
     model: claude-haiku-4-5-20251001
