@@ -80,3 +80,20 @@ async def test_referral_reply_names_the_referred_contact(conn: asyncpg.Connectio
     assert result["intent"] == "referral"
     assert result["referral_contact_named"] is not None
     assert "Priya" in result["referral_contact_named"]
+
+
+async def test_not_now_budget_deferral_no_explicit_date(conn: asyncpg.Connection):
+    """Budget-timing deferral: intent is not_now, not objection.
+
+    The fixture says "don't have the budget this quarter / check back later in
+    the year" — a timing deferral, not a cost-vs-value dispute.  V7 enforces
+    objection_category is null when intent != objection.  "Later in the year"
+    is not an explicit calendar date, so requested_resume_date must be null
+    (V8 corrects any non-null value when intent != not_now, but here we assert
+    the model doesn't hallucinate a date in the first place).
+    """
+    result = await _run(conn, "reply_not_now_budget.txt")
+    assert result["intent"] == "not_now"
+    assert result["objection_category"] is None
+    assert result["suggested_action"] == "pause_sequence"
+    assert result["requested_resume_date"] is None

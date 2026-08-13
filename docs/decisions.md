@@ -1502,3 +1502,31 @@ against a self-report at all).
 **Verification:** `ruff check`, `ruff format --check`, `mypy --strict` on
 `core/`/`db/`, and the full suite (224 tests now, 44 protected) all pass
 against a disposable Postgres instance, torn down after.
+
+## 2026-08-13 — Split reply_price_objection.txt into two fixtures
+
+**Context:** `tests/fixtures/reply_price_objection.txt` contained the text:
+*"...the pricing feels like it'd be high for where we are right now. We just don't
+have the budget for something like this this quarter. Maybe check back later in
+the year?"* — a budget-timing deferral, not a price objection (cost-vs-value
+dispute). The model correctly returned `intent=not_now`, causing the golden test
+asserting `intent=objection, objection_category=price` to fail. This was a
+fixture authoring error, not a model error.
+
+**Decision:** Rewrote `reply_price_objection.txt` as an unambiguous cost-vs-value
+dispute with no timing element (explicitly states "It's not a timing thing; we
+have budget" and disputes ROI). Created `reply_not_now_budget.txt` containing the
+original text. Updated the golden test for the price-objection case (unchanged
+assertions: `intent=objection, objection_category=price`) and added
+`test_not_now_budget_deferral_no_explicit_date` asserting `intent=not_now,
+objection_category=null, suggested_action=pause_sequence, requested_resume_date=null`.
+"Later in the year" is not an explicit calendar date — the model must not hallucinate
+a date, and V8 (correcting validator) would null any non-null `requested_resume_date`
+anyway when `intent != not_now`.
+
+**Consequence:** Both golden tests now cover distinct, correctly-labelled scenarios.
+The V7 cross-field check (`objection_category` non-null only when
+`intent==objection`) and V8 (`requested_resume_date` non-null only when
+`intent==not_now`) are the code-level guards that enforce the invariants these
+fixtures exercise.
+
