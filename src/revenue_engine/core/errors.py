@@ -57,6 +57,22 @@ class EventPayloadValidationError(RevenueEngineError):
         super().__init__(f"Invalid payload for event '{event_type}': {'; '.join(errors)}")
 
 
+class DisqualifierRuleError(RevenueEngineError):
+    """Raised by core/disqualifiers.py::parse_rule() when a pack's
+    icp.disqualifiers[].rule string uses anything beyond the small
+    `FIELD == "VALUE"` / `FIELD in [...]` (AND-combined) grammar the
+    deterministic scorer can evaluate, or references a field the scorer
+    cannot read. core/config.py turns this into a ConfigError at boot for
+    every disqualifier not marked `enforcement: manual` (docs/decisions.md,
+    M1.2 Correction 1) — an unenforceable disqualifier must never sit
+    silently in the pack looking like protection that isn't there."""
+
+    def __init__(self, rule: str, reason: str) -> None:
+        self.rule = rule
+        self.reason = reason
+        super().__init__(f"Unparseable disqualifier rule {rule!r}: {reason}")
+
+
 class ConfigError(RevenueEngineError):
     """Raised by core/config.py when config/base.yaml or the selected
     industry pack fails to load or validate. A hard boot failure, not a

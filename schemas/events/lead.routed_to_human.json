@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lead.routed_to_human",
+  "description": "Lead Qualification's R2 inbound bypass: a lead sourced from webform, inbound_reply, or referral is always routed to a human regardless of its band (entity-model.md §5 R2). Emitted alongside the normal lead.qualified.{band} event, never instead of it — the lead is still scored so Learning can compare inbound vs. outbound score quality. Emitted by Lead Qualification. Consumed by the Slack notifier (M1.3, not built).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lead_id", "band", "total", "source", "reason"],
+  "properties": {
+    "lead_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "band": {
+      "enum": ["cold", "warm", "mql", "sql"]
+    },
+    "total": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "source": {
+      "enum": ["webform", "manual_import", "discovery", "referral", "inbound_reply"],
+      "description": "Always one of webform/inbound_reply/referral in practice — this event is only ever emitted for those three (R2)."
+    },
+    "reason": {
+      "const": "inbound_bypass"
+    }
+  }
+}

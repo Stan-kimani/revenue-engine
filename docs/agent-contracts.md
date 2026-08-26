@@ -111,12 +111,14 @@ missing email; an unverified address is worse than no lead.
 | | |
 |---|---|
 | **Consumes** | `lead.enriched`, `reply.received` (re-score on engagement) |
-| **Reads** | leads, contacts, companies, messages, lead_scores, industry pack |
+| **Reads** | leads, contacts, companies, messages, meetings, lead_scores, industry pack |
 | **Emits** | `lead.scored`, `lead.qualified.{cold\|warm\|mql\|sql}`, `lead.routed_to_human` |
 
 **Deterministic logic (the majority of the score)**
 - ICP field matches: industry in list, employee_band in range, geography, disqualifiers.
-- Engagement points: opens*, clicks, replies, meetings — counted from `messages`.
+- Engagement points: opens*, clicks, replies (from `messages`), meetings (from `meetings`) —
+  corrected M1.2: `meetings` is the strongest engagement signal available and is now read
+  directly, not folded into `messages`.
 - Weighted sum using `scoring.weights` from the **pinned** `industry_pack` on the lead.
 - Band assignment from `scoring.bands` thresholds. **Never LLM-decided.**
 - Inbound bypass (R2): if `source ∈ {webform, inbound_reply, referral}` → emit

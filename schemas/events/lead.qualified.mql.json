@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lead.qualified.mql",
+  "description": "Lead Qualification banded a lead as 'mql' (agent-contracts.md §2). Emitted by Lead Qualification. Consumed by: mql's consumer varies — sql routes to Sales (orchestrator/router.py's lead.qualified.* prefix); mql/warm/cold have no Phase-1-agent consumer yet (nurture is Phase 4; cold takes no action) — see router.py's UNCONSUMED table.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lead_id", "band", "total", "campaign_id", "source"],
+  "properties": {
+    "lead_id": { "type": "string", "format": "uuid" },
+    "band": { "const": "mql" },
+    "total": { "type": "number", "minimum": 0, "maximum": 100 },
+    "campaign_id": { "type": ["string", "null"], "format": "uuid" },
+    "source": {
+      "enum": ["webform", "manual_import", "discovery", "referral", "inbound_reply"]
+    }
+  }
+}

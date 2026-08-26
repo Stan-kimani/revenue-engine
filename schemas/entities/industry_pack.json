@@ -78,7 +78,11 @@
             "properties": {
               "id": { "type": "string" },
               "rule": { "type": "string" },
-              "reason": { "type": "string" }
+              "reason": { "type": "string" },
+              "enforcement": {
+                "enum": ["scored", "manual"],
+                "description": "Absent or 'scored' means core/config.py must be able to parse `rule` (core/disqualifiers.py's grammar) or boot fails. 'manual' means the rule uses a form the deterministic scorer cannot evaluate (e.g. `matches` against unstructured text) - the loader accepts it unparsed, agents/qualification.py never evaluates it, and qualification.discovery_checklist is expected to cover it on the human call instead (M1.2 Correction 1, docs/decisions.md)."
+              }
             }
           }
         }
@@ -87,7 +91,16 @@
     "scoring": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["weights", "budget_fit_map", "bands", "min_confidence_to_store", "guidance"],
+      "required": [
+        "weights",
+        "budget_fit_map",
+        "bands",
+        "min_confidence_to_store",
+        "guidance",
+        "llm_subscore_weights",
+        "engagement_points",
+        "engagement_saturation"
+      ],
       "properties": {
         "weights": {
           "type": "object",
@@ -114,6 +127,23 @@
         "guidance": {
           "type": "string",
           "description": "Rendered verbatim into qualification/score_lead.md as {{scoring_guidance}}."
+        },
+        "llm_subscore_weights": {
+          "type": "object",
+          "description": "How agents/qualification.py combines score_lead.md's buying_intent/seniority_fit/narrative_fit sub-scores into the single `weights.intent` component. Must sum to 1.0 +/- 0.001 - asserted in core/config.py (M1.2 Correction 3, docs/decisions.md).",
+          "minProperties": 1,
+          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "engagement_points": {
+          "type": "object",
+          "description": "Raw points per counted engagement signal (reply, meeting). No literal weights in code (CLAUDE.md §3).",
+          "minProperties": 1,
+          "additionalProperties": { "type": "number", "minimum": 0 }
+        },
+        "engagement_saturation": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Raw points at which the engagement component saturates at 1.0."
         }
       }
     },

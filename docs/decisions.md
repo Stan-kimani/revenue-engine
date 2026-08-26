@@ -1812,3 +1812,128 @@ worth a tightened wording pass on `enrich_company.md` rule 4 if it recurs elsewh
 but out of scope for this fix since the corrected fixture no longer exercises that
 inference path at all.
 
+## 2026-08-26 — M1.2: Lead Qualification agent (deterministic + LLM hybrid scorer)
+
+**Context:** implements agent-contracts.md §2 and entity-model.md §3.5. The plan was
+approved with three corrections; this entry logs the resulting decisions.
+
+**Correction 1 — disqualifiers the scorer cannot evaluate must fail the boot, not
+sit silently.** `icp.disqualifiers[].rule` mixes clean `field == "value"` / `field in
+[...]` comparisons with `matches` against unstructured/LLM-inferred text
+(`positioning`, `industry`) that has no defined semantics anywhere in the docs.
+Added `core/disqualifiers.py`: a small, closed grammar (`FIELD == "VALUE"` / `FIELD
+in [...]`, `AND`-combined, over `employee_band`/`business_model`/`revenue_signal`
+only). `core/config.py::load_config()` now calls `parse_rule()` on every
+`icp.disqualifiers[]` entry not marked `enforcement: manual` and raises `ConfigError`
+if it can't parse (`_assert_disqualifiers_evaluable`) — verified live: deleting
+`enforcement: manual` from `regulated_health` in a scratch copy of the real pack
+raises `ConfigError` citing the exact clause it can't parse.
+
+**Chose `enforcement: manual` over implementing `matches`**, for both
+`bespoke_creative` and `regulated_health`: a hand-rolled fuzzy-text matcher for a
+PHI-compliance gate would still be a guess wearing a confident label — exactly the
+"reads as protection that isn't there" failure mode this correction exists to catch,
+just moved one layer down. `enforcement: manual` is also what the pack's own
+pre-existing header comment already claimed this section should be ("Human-judgment
+disqualifiers live in qualification.discovery_checklist... do NOT put them here").
+Added `qualification.discovery_checklist` entries `bespoke_project_work` and
+`regulated_health_data` so "the discovery checklist covers them" is literally true,
+not aspirational — schemas/entities/industry_pack.json gained the optional
+`enforcement` enum (`scored`/`manual`) on disqualifier entries.
+
+**Correction 2 — engagement must count meetings, not just replies.**
+`agents/qualification.py` now reads `meetings` directly (`repo.count_meetings`), not
+only `messages` (`repo.count_inbound_messages`); `docs/agent-contracts.md` §2's Reads
+row updated to add `meetings` (was previously incomplete against agent-contracts.md's
+own prose, which already said "meetings" without the Reads row listing the table).
+Points-per-signal (`reply: 1.0`, `meeting: 5.0`) and a saturation cap live in the pack
+(`scoring.engagement_points` / `engagement_saturation`, new required pack keys) —
+never literals in code (CLAUDE.md §3). `open`/`click` are absent from the formula
+entirely, not present at weight 0: `messages` has no `opened_at`/`clicked_at` column,
+so there is nothing to count yet.
+
+**Correction 3 — the LLM sub-score combination formula must be config, not code.**
+Added `scoring.llm_subscore_weights` (new required pack key: `buying_intent`,
+`seniority_fit`, `narrative_fit`, defaulting to equal thirds — 0.3334/0.3333/0.3333
+so they sum to exactly 1.0) and `_assert_llm_subscore_weights_sum_to_one`, asserted at
+boot with the same `+/- 0.001` tolerance as `scoring.weights`. `_combine_llm_subscores`
+reads it from the lead's PINNED pack (never `get_config()`), same as every other
+scoring weight.
+
+**Confirmed unchanged from the approved plan:** `load_config(industry_pack=lead.industry_pack)`
+never `get_config()` (`_pinned_pack`, `@cache`d per pack name, mirroring
+`get_config()`'s own process-lifetime caching); `icp_match` and `size_fit` kept
+distinct (same "1-10" band scores 1.0 in one, 0.5 in the other — see
+`test_icp_match_and_size_fit_do_not_double_count_the_same_band`); a disqualifier hit
+forces `band=cold` but the numeric `total` is still stored for audit
+(`test_disqualifier_hit_forces_cold_regardless_of_other_components` constructs a lead
+that would otherwise score >60 on every other axis); no `orchestrator/router.py`
+edits (`lead.enriched`/`reply.received` → `qualification.score` were already wired at
+M0.3); no new migration (`lead_scores` already existed in migration 0001).
+
+**A real precision bug found and fixed before the reconciliation test was written:**
+independently rounding `total`, `deterministic_part`, and `llm_part` to 2 decimal
+places from their underlying floats does not guarantee
+`deterministic_part + llm_part == total` (each can round a different direction).
+Fixed by rounding the two parts first and deriving `total` as their exact `Decimal`
+sum, then using that same rounded total for band assignment and every emitted event
+payload — never three independently-rounded numbers that can silently disagree by a
+cent.
+
+**Duplication, not shared refactor:** `_icp_definition_text` in
+`agents/qualification.py` duplicates a same-purpose helper already in
+`agents/leadgen.py`, rather than promoting both to a shared `IndustryPack` method in
+`core/config.py`. CLAUDE.md §4's "minimum abstraction... until there are two real
+implementations" would justify sharing now that a second caller exists, but this
+milestone was scoped to the qualification agent only; touching M1.1's shipped
+`leadgen.py` (even a pure, non-behaviour-changing refactor) was judged out of scope
+rather than assumed in-scope. Worth revisiting if a third caller appears.
+
+**`reply.received` still has no `schemas/events/reply.received.json`** — deliberately
+out of this milestone's deliverable list, and no emitter for it exists yet (the sales
+agent is M1.4). The re-score path is tested by enqueueing a `qualification.score` job
+directly via `repo.enqueue_job()` with a `reply.received`-shaped payload
+(event-catalog.md §3's documented shape) — jobs carry no schema, only events do, so
+this needed no schema file. Where the test needed a real `events` row to satisfy
+`agent_runs.trigger_event`'s foreign key, it used `repo.emit_event()` directly (the
+repository primitive under `core/events.py::emit()`, which persists without schema
+validation — schema validation is `core/events.py`'s job, not `repositories.py`'s).
+
+**`leads.status` after scoring is always `SCORED`, regardless of band** — `QUALIFIED`
+status was judged to more plausibly belong to a later, human-gated lifecycle step
+(post discovery-call), not automated banding; revisit if a future milestone needs
+otherwise.
+
+**Tests:** `tests/unit/test_qualification_scoring.py` (16 tests, pure functions, no
+DB) — protected: byte-identical determinism, band-threshold-exact (parametrized
+across all four boundaries), disqualifier-forces-cold. Standard: absence-of-evidence
+never disqualifies, manual-enforcement rules are skipped, icp_match/size_fit stay
+distinct, two differently-weighted packs produce different totals, LLM sub-score
+weights are honoured, meetings move the engagement score. `tests/unit/test_config.py`
+gained 7 tests for the two new boot-time assertions (llm_subscore_weights sum,
+disqualifier evaluability — both directions, plus a regression guard that the real
+shipped pack still boots). `tests/integration/test_qualification.py` (5 tests) —
+protected: inbound bypass emits both `lead.qualified.{band}` and
+`lead.routed_to_human`. Standard: append-only re-scoring across a real
+`lead.enriched` → `reply.received`-shaped re-score sequence (asserts the OLD row is
+byte-unchanged), `deterministic_part + llm_part == total` reconciliation, a real
+`lead.enriched → router → qualification.score job → handler → lead.scored →
+lead.qualified.X` path through the actual worker (`run_worker.dispatch_one_event`/
+`process_one_job`/`HANDLERS`), and a disqualifier hit banding a lead cold end-to-end
+even under a maximally generous stub LLM response.
+
+**Verification:** `scripts/migrate.py` (no-op, 4 previously applied — no new
+migration was needed), `ruff check`/`ruff format --check` clean, `mypy --strict` on
+`core/`+`db/` clean (and `agents/qualification.py` clean under plain `mypy` too, not
+just strict-scoped), full suite 269 passed (was 236 before this milestone),
+`pytest -m protected --collect-only` confirms every required protected test exists,
+and the post-suite `schema_migrations` integrity check against the persistent
+session-local `DATABASE_URL` Postgres (docker-compose, used throughout M0.1-M1.1 and
+this milestone — not a freshly disposable instance) shows exactly the same 4 rows as
+before the run.
+
+**Consequence:** `scripts/score_distribution.py` is ready to report calibration
+(median/quartiles/band counts of `llm_part` per prompt version) once real leads
+exist, per phase1-llm-boundary.md §6 — the prompt itself was not touched, per the
+explicit instruction not to tune it without real data.
+

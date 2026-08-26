@@ -31,7 +31,7 @@ from typing import Any
 import asyncpg
 from dotenv import load_dotenv
 
-from revenue_engine.agents import leadgen
+from revenue_engine.agents import leadgen, qualification
 from revenue_engine.core import queue as core_queue
 from revenue_engine.db import repositories as repo
 from revenue_engine.db.models import Job
@@ -44,13 +44,16 @@ _EVENT_DISPATCH_LOCK_KEY = 72711583
 
 JobHandler = Callable[[asyncpg.Connection, Job], Awaitable[None]]
 
-# M1.1: leadgen is the first registered agent. orchestrator/router.py already
-# routes "lead.captured" -> JobSpec("leadgen.enrich") (M0.3, anticipating
-# this) — the actual wiring gap was always here, not in router.py. Tests may
-# still populate their own additional entries to exercise claim/execute/
-# complete/fail/dead-letter machinery in isolation from any real agent.
+# M1.1: leadgen is the first registered agent. M1.2 adds qualification.
+# orchestrator/router.py already routes "lead.captured" -> JobSpec("leadgen.enrich")
+# and both "lead.enriched"/"reply.received" -> JobSpec("qualification.score")
+# (M0.3, anticipating this) — the actual wiring gap was always here, not in
+# router.py. Tests may still populate their own additional entries to
+# exercise claim/execute/complete/fail/dead-letter machinery in isolation
+# from any real agent.
 HANDLERS: dict[str, JobHandler] = {
     "leadgen.enrich": leadgen.handle_enrich,
+    "qualification.score": qualification.handle_score,
 }
 
 _STRUCTURED_FIELDS = (

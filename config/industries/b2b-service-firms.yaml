@@ -44,9 +44,18 @@ icp:
       manager: 0.45
       ic: 0.1
 
-  # Machine-checkable only. Human-judgment disqualifiers live in
-  # qualification.discovery_checklist below — do NOT put them here, the scorer
-  # cannot see them and pretending otherwise makes scores dishonest.
+  # Machine-checkable ("scored") entries only, unless explicitly marked
+  # enforcement: manual. The config loader (core/config.py) fails the boot on
+  # any entry it cannot parse into core/disqualifiers.py's small grammar
+  # (FIELD == "VALUE" / FIELD in [...], AND-combined) unless enforcement:
+  # manual is set — an unenforceable disqualifier sitting quietly here is
+  # worse than none, because it reads as protection that isn't there (M1.2
+  # Correction 1, docs/decisions.md). bespoke_creative and regulated_health
+  # use `matches` against unstructured/LLM-inferred text (positioning,
+  # industry) with no defined match semantics anywhere in these docs — marked
+  # enforcement: manual rather than guessed at, and both now have a
+  # corresponding qualification.discovery_checklist entry below so a human
+  # actually asks about them on the call.
   disqualifiers:
     - id: too_small
       rule: employee_band == "1-10" AND revenue_signal in [pre_revenue, early]
@@ -54,6 +63,7 @@ icp:
     - id: bespoke_creative
       rule: business_model == "creative_studio" OR positioning matches bespoke_project_work
       reason: "Every job differs; automation savings cannot be evidenced."
+      enforcement: manual
     - id: competitor
       rule: business_model in [automation_agency, ai_consultancy, rpa_vendor]
       reason: "They sell what we sell."
@@ -65,6 +75,7 @@ icp:
       reason: >
         Patient data requires a compliance posture (BAA, PHI handling, residency) we do
         not yet have. Deliberate exclusion, not an oversight. Revisit when it exists.
+      enforcement: manual
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -89,6 +100,27 @@ scoring:
     warm: 38
     # below warm = cold
   min_confidence_to_store: 0.4    # attributes below this are discarded, not stored
+
+  # How agents/qualification.py combines score_lead.md's three fuzzy sub-scores
+  # into the single `weights.intent` component above — MUST sum to 1.0, asserted
+  # by the config loader at boot, same as `weights` (M1.2 Correction 3). Equal
+  # thirds is a starting default, not a considered calibration; there is no real
+  # scoring data yet to justify weighting one sub-score over another.
+  llm_subscore_weights:
+    buying_intent: 0.3334
+    seniority_fit: 0.3333
+    narrative_fit: 0.3333
+
+  # Raw points per counted engagement signal (agents/qualification.py). A meeting
+  # is a materially stronger signal than a reply, hence the 5x — a starting
+  # default, not a calibration; revisit once real engagement data exists (same
+  # caveat as llm_subscore_weights above). open/click are deliberately absent,
+  # not present at 0: messages has no opened_at/clicked_at column, so there is
+  # nothing to count yet, not a deliberate down-weighting choice.
+  engagement_points:
+    reply: 1.0
+    meeting: 5.0
+  engagement_saturation: 5.0   # raw points at which engagement score reaches 1.0
 
   # Passed to qualification/score_lead.md as {{scoring_guidance}}
   guidance: |
@@ -143,6 +175,17 @@ qualification:
       question: "Are you open to changing how the team works, or do you want a tool bolted on?"
       fail_if: "Tool-only. Expects software to fix a process problem."
       reason: "Sustainable value comes from process redesign, not just software."
+    # The next two back icp.disqualifiers[].enforcement: manual entries above
+    # (bespoke_creative, regulated_health) — the scorer cannot evaluate either
+    # (both use `matches` against unstructured text), so a human must ask.
+    - id: bespoke_project_work
+      question: "Does the volume or shape of this work change meaningfully from one job to the next?"
+      fail_if: "Every engagement is bespoke enough that no two runs of the workflow look alike."
+      reason: "Mirrors icp.disqualifiers.bespoke_creative — automation savings cannot be evidenced when nothing repeats."
+    - id: regulated_health_data
+      question: "Does this workflow touch patient data, PHI, or anything HIPAA-adjacent?"
+      fail_if: "Yes, in any form."
+      reason: "Mirrors icp.disqualifiers.regulated_health — we do not yet have a compliance posture (BAA, PHI handling, residency) for this."
 
 # ---------------------------------------------------------------------------
 # Voice — passed to all drafting prompts as {{voice_rules}} / {{sender_persona}}

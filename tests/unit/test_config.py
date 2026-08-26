@@ -147,6 +147,107 @@ def test_refuses_to_boot_when_pack_fails_json_schema(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# M1.2 Correction 3 — llm_subscore_weights, same rigor as scoring.weights
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_when_llm_subscore_weights_do_not_sum_to_one(tmp_path: Path):
+    data = _real_pack_data()
+    data["scoring"] = dict(data["scoring"])
+    data["scoring"]["llm_subscore_weights"] = {"buying_intent": 0.3, "seniority_fit": 0.3}  # 0.6
+    industries_dir = tmp_path / "industries"
+    _write_pack(industries_dir, data, "test-pack")
+
+    with pytest.raises(ConfigError, match="llm_subscore_weights must sum to 1.0"):
+        _load(industries_dir, industry_pack="test-pack")
+
+
+def test_boots_when_llm_subscore_weights_sum_is_within_tolerance(tmp_path: Path):
+    data = _real_pack_data()
+    data["scoring"] = dict(data["scoring"])
+    data["scoring"]["llm_subscore_weights"] = {
+        "buying_intent": 0.3334,
+        "seniority_fit": 0.3333,
+        "narrative_fit": 0.3333,
+    }
+    industries_dir = tmp_path / "industries"
+    _write_pack(industries_dir, data, "test-pack")
+
+    config = _load(industries_dir, industry_pack="test-pack")
+    assert abs(sum(config.pack.scoring.llm_subscore_weights.values()) - 1.0) < 0.001
+
+
+# ---------------------------------------------------------------------------
+# M1.2 Correction 1 — a disqualifier the scorer cannot evaluate must fail the
+# boot unless explicitly marked enforcement: manual.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_on_unparseable_disqualifier_rule(tmp_path: Path):
+    data = _real_pack_data()
+    data["icp"] = dict(data["icp"])
+    data["icp"]["disqualifiers"] = [
+        {
+            "id": "fuzzy_rule",
+            "rule": 'business_model == "creative_studio" OR positioning matches something',
+            "reason": "unparseable — uses OR and `matches`, not marked manual",
+        }
+    ]
+    industries_dir = tmp_path / "industries"
+    _write_pack(industries_dir, data, "test-pack")
+
+    with pytest.raises(ConfigError, match="cannot evaluate"):
+        _load(industries_dir, industry_pack="test-pack")
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_on_disqualifier_rule_with_unknown_field(tmp_path: Path):
+    data = _real_pack_data()
+    data["icp"] = dict(data["icp"])
+    data["icp"]["disqualifiers"] = [
+        {
+            "id": "unknown_field_rule",
+            "rule": 'headcount == "1-10"',  # not employee_band, business_model, or revenue_signal
+            "reason": "field the scorer cannot read",
+        }
+    ]
+    industries_dir = tmp_path / "industries"
+    _write_pack(industries_dir, data, "test-pack")
+
+    with pytest.raises(ConfigError, match="cannot evaluate"):
+        _load(industries_dir, industry_pack="test-pack")
+
+
+def test_boots_when_unparseable_disqualifier_is_marked_enforcement_manual(tmp_path: Path):
+    data = _real_pack_data()
+    data["icp"] = dict(data["icp"])
+    data["icp"]["disqualifiers"] = [
+        {
+            "id": "fuzzy_rule",
+            "rule": 'business_model == "creative_studio" OR positioning matches something',
+            "reason": "unparseable, but explicitly marked manual",
+            "enforcement": "manual",
+        }
+    ]
+    industries_dir = tmp_path / "industries"
+    _write_pack(industries_dir, data, "test-pack")
+
+    config = _load(industries_dir, industry_pack="test-pack")
+    assert config.pack.name == "test-pack"
+
+
+def test_boots_when_all_disqualifier_rules_parse(tmp_path: Path):
+    # The real pack's structured disqualifiers (too_small, competitor,
+    # enterprise) must parse; bespoke_creative/regulated_health are marked
+    # enforcement: manual. This is really a regression guard on the shipped
+    # pack, not a synthetic fixture.
+    config = _load(_REAL_PACK_PATH.parent, industry_pack="b2b-service-firms")
+    assert config.pack.name == "b2b-service-firms"
+
+
+# ---------------------------------------------------------------------------
 # Pack selection
 # ---------------------------------------------------------------------------
 

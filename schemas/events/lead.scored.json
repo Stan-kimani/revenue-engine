@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lead.scored",
+  "description": "Qualification finished scoring a lead: deterministic components plus the LLM's fuzzy sub-scores were combined into one total and band. Emitted by Lead Qualification. Consumed by the router (band decision already carried in the payload) and, later, Learning.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lead_id",
+    "score_id",
+    "total",
+    "band",
+    "deterministic_part",
+    "llm_part",
+    "industry_pack",
+    "prompt_version",
+    "run_id"
+  ],
+  "properties": {
+    "lead_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "score_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "lead_scores.id of the append-only row this event describes."
+    },
+    "total": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "band": {
+      "enum": ["cold", "warm", "mql", "sql"]
+    },
+    "deterministic_part": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "llm_part": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "industry_pack": {
+      "type": "string",
+      "description": "The lead's PINNED pack name (leads.industry_pack) — the pack that actually produced this score, not whichever pack happens to be currently configured."
+    },
+    "prompt_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "qualification/score_lead.md's version at the time of this call."
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "agent_runs.id of the qualification/score_lead complete_json() call."
+    }
+  }
+}

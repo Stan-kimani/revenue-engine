@@ -40,6 +40,7 @@ from .models import (
     Lead,
     LeadBand,
     LeadCreationResult,
+    LeadScore,
     LeadSource,
     LeadStatus,
     PainCategory,
@@ -473,6 +474,104 @@ async def get_active_or_deferred_lead_by_contact(
     return _row_to_lead(row) if row else None
 
 
+async def refresh_lead_band_and_score(
+    conn: asyncpg.Connection,
+    lead_id: UUID,
+    *,
+    current_score: Decimal,
+    band: LeadBand,
+    status: LeadStatus,
+) -> Lead:
+    """Refresh `leads.current_score`/`band`/`status` after a new `lead_scores`
+    row is inserted — `current_score` is a denormalised cache of the latest
+    append-only score (entity-model.md §3.5), never the source of truth
+    itself."""
+    row = await conn.fetchrow(
+        """
+        UPDATE leads
+        SET current_score = $2, band = $3, status = $4, last_activity_at = now(), updated_at = now()
+        WHERE id = $1
+        RETURNING *
+        """,
+        lead_id,
+        current_score,
+        band.value,
+        status.value,
+    )
+    if row is None:
+        raise RevenueEngineError(f"Lead not found: {lead_id}")
+    return _row_to_lead(row)
+
+
+# ============================================================================
+# Lead scores (append-only, entity-model.md §3.5) & engagement counts
+# ============================================================================
+
+
+async def insert_lead_score(
+    conn: asyncpg.Connection,
+    *,
+    lead_id: UUID,
+    total: Decimal,
+    band: LeadBand,
+    components: dict[str, Any],
+    deterministic_part: Decimal,
+    llm_part: Decimal,
+    prompt_version: int,
+    model: str,
+    run_id: UUID,
+) -> LeadScore:
+    """Always a plain INSERT, never an upsert — lead_scores is append-only by
+    design (entity-model.md §3.5: 'Never updated. Never deleted.'). Every
+    re-score is a new row, so a lead's score history is auditable."""
+    row = await conn.fetchrow(
+        """
+        INSERT INTO lead_scores (lead_id, total, band, components, deterministic_part,
+                                  llm_part, prompt_version, model, run_id)
+        VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9)
+        RETURNING *
+        """,
+        lead_id,
+        total,
+        band.value,
+        _dump_json(components),
+        deterministic_part,
+        llm_part,
+        prompt_version,
+        model,
+        run_id,
+    )
+    assert row is not None
+    return _row_to_lead_score(row)
+
+
+async def get_lead_scores(conn: asyncpg.Connection, lead_id: UUID) -> list[LeadScore]:
+    """All score history for one lead, oldest first — used by tests asserting
+    append-only behaviour and, later, by the Learning Agent."""
+    rows = await conn.fetch(
+        "SELECT * FROM lead_scores WHERE lead_id = $1 ORDER BY scored_at ASC", lead_id
+    )
+    return [_row_to_lead_score(row) for row in rows]
+
+
+async def count_inbound_messages(conn: asyncpg.Connection, lead_id: UUID) -> int:
+    """Replies — the one engagement signal `messages` actually carries today
+    (agents/qualification.py's engagement component). No opened_at/clicked_at
+    columns exist yet (migrations/0001), so opens/clicks cannot be counted at
+    all here, not merely down-weighted."""
+    count = await conn.fetchval(
+        "SELECT count(*) FROM messages WHERE lead_id = $1 AND direction = 'inbound'", lead_id
+    )
+    return int(count)
+
+
+async def count_meetings(conn: asyncpg.Connection, lead_id: UUID) -> int:
+    """Meetings booked for this lead — the strongest engagement signal
+    available (M1.2 Correction 2, docs/decisions.md)."""
+    count = await conn.fetchval("SELECT count(*) FROM meetings WHERE lead_id = $1", lead_id)
+    return int(count)
+
+
 # ============================================================================
 # Events (outbox)
 # ============================================================================
@@ -878,6 +977,22 @@ def _row_to_lead(row: asyncpg.Record) -> Lead:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         deleted_at=row["deleted_at"],
+    )
+
+
+def _row_to_lead_score(row: asyncpg.Record) -> LeadScore:
+    return LeadScore(
+        id=row["id"],
+        lead_id=row["lead_id"],
+        total=row["total"],
+        band=LeadBand(row["band"]),
+        components=json.loads(row["components"]),
+        deterministic_part=row["deterministic_part"],
+        llm_part=row["llm_part"],
+        prompt_version=row["prompt_version"],
+        model=row["model"],
+        run_id=row["run_id"],
+        scored_at=row["scored_at"],
     )
 
 

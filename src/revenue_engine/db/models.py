@@ -200,6 +200,24 @@ class LeadCreationResult(BaseModel):
     error: str | None = None
 
 
+class LeadScore(BaseModel):
+    """One append-only row of `lead_scores` (entity-model.md §3.5). Never
+    updated, never deleted — a re-score is a new row, never a mutation of an
+    old one."""
+
+    id: UUID
+    lead_id: UUID
+    total: Decimal
+    band: LeadBand
+    components: dict[str, Any]
+    deterministic_part: Decimal | None
+    llm_part: Decimal | None
+    prompt_version: int | None
+    model: str | None
+    run_id: UUID | None
+    scored_at: datetime
+
+
 class Event(BaseModel):
     event_id: UUID
     type: str

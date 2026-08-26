@@ -36,7 +36,8 @@ import jsonschema
 import yaml
 
 from ..db.models import Tier
-from .errors import ConfigError
+from .disqualifiers import parse_rule
+from .errors import ConfigError, DisqualifierRuleError
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_BASE_CONFIG_PATH = _REPO_ROOT / "config" / "base.yaml"
@@ -83,6 +84,22 @@ class ScoringConfig:
     min_confidence_to_store: float
     guidance: str
     """Rendered verbatim as {{scoring_guidance}} in qualification/score_lead.md."""
+    llm_subscore_weights: MappingProxyType[str, float]
+    """How agents/qualification.py combines score_lead.md's three fuzzy
+    sub-scores (buying_intent, seniority_fit, narrative_fit) into the single
+    `intent` component `weights` above defines — a scoring decision, so it
+    lives in the pack like every other one (M1.2 Correction 3, docs/decisions.md).
+    Must sum to 1.0 +/- _WEIGHT_SUM_TOLERANCE, asserted at boot below, same as
+    `weights` itself."""
+    engagement_points: MappingProxyType[str, float]
+    """Raw points per counted engagement signal (currently `reply`, `meeting`)
+    — CLAUDE.md §3: tunable numbers live in config, never as literals in
+    agents/qualification.py. `open`/`click` are deliberately absent, not
+    present at 0: no tracking columns exist yet (messages has no
+    opened_at/clicked_at), so there is nothing to count, not a weighting
+    choice."""
+    engagement_saturation: float
+    """Raw points at which the engagement component saturates at 1.0."""
 
 
 @dataclass(frozen=True)
@@ -202,6 +219,8 @@ def load_config(
 
     _validate_pack_schema(raw_pack, pack_schema_path, pack_path)
     _assert_weights_sum_to_one(raw_pack, pack_path)
+    _assert_llm_subscore_weights_sum_to_one(raw_pack, pack_path)
+    _assert_disqualifiers_evaluable(raw_pack, pack_path)
     _assert_objection_categories_match(
         raw_pack, pack_path, reply_classification_schema_path, objection_response_schema_path
     )
@@ -309,6 +328,36 @@ def _assert_weights_sum_to_one(raw_pack: dict[str, Any], pack_path: Path) -> Non
         )
 
 
+def _assert_llm_subscore_weights_sum_to_one(raw_pack: dict[str, Any], pack_path: Path) -> None:
+    weights = raw_pack["scoring"]["llm_subscore_weights"]
+    total = sum(float(w) for w in weights.values())
+    if abs(total - 1.0) > _WEIGHT_SUM_TOLERANCE:
+        raise ConfigError(
+            f"{pack_path}: scoring.llm_subscore_weights must sum to 1.0 "
+            f"(+/- {_WEIGHT_SUM_TOLERANCE}), got {total} from {dict(weights)}"
+        )
+
+
+def _assert_disqualifiers_evaluable(raw_pack: dict[str, Any], pack_path: Path) -> None:
+    """Fails the boot on any icp.disqualifiers[] entry the deterministic
+    scorer cannot evaluate, unless it is explicitly marked
+    `enforcement: manual` (M1.2 Correction 1, docs/decisions.md). A
+    disqualifier that silently can't be checked is worse than none — it
+    reads as protection that isn't there."""
+    for entry in raw_pack.get("icp", {}).get("disqualifiers", []):
+        if entry.get("enforcement") == "manual":
+            continue
+        try:
+            parse_rule(entry["rule"])
+        except DisqualifierRuleError as exc:
+            raise ConfigError(
+                f"{pack_path}: disqualifier '{entry['id']}' has a rule the deterministic "
+                f"scorer cannot evaluate ({exc.reason}). Either rewrite it in the supported "
+                "grammar (core/disqualifiers.py), or mark it `enforcement: manual` and make "
+                "sure qualification.discovery_checklist covers it on the human call."
+            ) from exc
+
+
 def _assert_objection_categories_match(
     raw_pack: dict[str, Any],
     pack_path: Path,
@@ -343,6 +392,11 @@ def _parse_pack(raw_pack: dict[str, Any]) -> IndustryPack:
         bands=MappingProxyType(dict(scoring_raw["bands"])),
         min_confidence_to_store=scoring_raw["min_confidence_to_store"],
         guidance=scoring_raw["guidance"],
+        llm_subscore_weights=MappingProxyType(dict(scoring_raw["llm_subscore_weights"])),
+        engagement_points=MappingProxyType(
+            {k: float(v) for k, v in scoring_raw["engagement_points"].items()}
+        ),
+        engagement_saturation=float(scoring_raw["engagement_saturation"]),
     )
 
     voice_raw = raw_pack["voice"]
