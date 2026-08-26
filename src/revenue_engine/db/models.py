@@ -154,6 +154,7 @@ class Lead(BaseModel):
     problem_statement: str | None
     pain_category: PainCategory | None
     team_size_band: TeamSizeBand | None
+    profile: dict[str, Any] | None
     first_touched_at: datetime | None
     last_activity_at: datetime | None
     created_at: datetime

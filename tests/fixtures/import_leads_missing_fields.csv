@@ -1,0 +1,4 @@
+company_name,domain,contact_first_name,contact_last_name,contact_email,contact_title,linkedin_url,source_note
+Good Co,goodco-fixture.example,Sam,Lee,sam@goodco-fixture.example,Owner,,
+No Domain Co,,Alex,Kim,alex@nodomain-fixture.example,Owner,,
+No Email Co,noemail-fixture.example,Taylor,Ng,,Owner,,

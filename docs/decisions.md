@@ -1556,3 +1556,201 @@ transport-level attempts *per* validation attempt; the `retry_count=1` in
 of network round-trips. The Learning Agent's analysis of `agent_runs.retry_count`
 must treat it as measuring schema/validation re-drafts only.
 
+## 2026-08-25 — M1.1: Leadgen agent, ManualCsvProvider, scripts/import_leads.py
+
+Environment note first, unrelated to the milestone itself: this round of
+work began by discovering the working checkout (a OneDrive-synced Windows
+clone) had fallen behind `origin/main` after a force-push rewrote the tip
+three commits into a different shape (same content, squashed differently).
+That checkout was abandoned; all M1.1 work below was done against
+`/home/adminkim/projects/revenue-engine` (WSL) at `1706ec5`, confirmed via
+`git log --oneline -1` before anything was read or written.
+
+**Two decisions confirmed before writing code (asked, not assumed):**
+
+1. **`core/llm.py::complete_json()`'s return contract is unchanged.**
+   Provenance envelopes need `agent_runs.id` as `run_id`, but
+   `complete_json()` only ever returned the parsed output dict — the
+   `AgentRun` row it inserts on success was discarded, not handed back.
+   Chose "query it back out" over "change the return type": new
+   `repositories.get_latest_agent_run(agent, prompt_id, trigger_event,
+   status)`, called immediately after each `complete_json()` call. Safe
+   because job-claim exclusivity (`SELECT ... FOR UPDATE SKIP LOCKED`) means
+   only one worker is ever writing a row for a given `(agent, prompt_id,
+   trigger_event)` at a time, and `ORDER BY created_at DESC LIMIT 1` stays
+   correct even across a crash-and-retry (a reclaimed job's second attempt
+   still finds its own, most recent row). Zero blast radius on M0.4's
+   existing contract or its two test files.
+2. **`leads.profile jsonb` (migrations/0003_lead_profile.sql).** The
+   `build_prospect_profile` output has nowhere to persist — `leads` has no
+   `attributes` column (only `companies`/`contacts` do), and
+   `prompts/qualification/score_lead.md` (M1.2, future) needs it back as its
+   `prospect_profile` variable across a job/event boundary the generating
+   process won't survive. Nullable, additive, plain `ALTER TABLE ADD
+   COLUMN` — no backfill needed (no agent code existed to have written
+   anything yet).
+
+**Correction 1 (post-plan, before code): re-import idempotency made
+structural, not check-then-act.** The originally planned mechanism was a
+pre-check (`get_active_or_deferred_lead_by_contact`) before calling
+`create_lead` — flagged, correctly, as a two-operation race: two concurrent
+imports of the same CSV could both pass the check and both insert a deferred
+placeholder, since neither `one_active_lead_per_contact` nor
+`one_active_lead_per_company` (migrations/0001) excludes a *second*
+`status='deferred'` row for the same contact — only the *active*-lead case
+was ever structurally guarded.
+
+Fixed the same way D2/R1 fixed the active-lead case: a new partial unique
+index, `migrations/0004_one_deferred_lead_per_contact.sql`
+(`ON leads (contact_id) WHERE status = 'deferred' AND deleted_at IS NULL`).
+`repositories.create_lead()`'s deferred-insert branch now targets it with
+`ON CONFLICT (contact_id) WHERE status = 'deferred' AND deleted_at IS NULL
+DO NOTHING`; on conflict, the existing deferred row is re-read and returned
+instead of a second one being created. The application-level pre-check is
+kept in `scripts/import_leads.py` — but explicitly as an optimisation (skips
+redundant DB/LLM work for an already-imported row), not as the guarantee.
+`DuplicateActiveLeadError` (the *active*-lead race, already structurally
+guarded since M0.2) is now also caught in `_import_row` and converted to the
+same idempotent re-emit path, for the same reason: a caller that loses that
+race must get a typed, idempotent outcome, not a crash.
+
+New protected test:
+`test_concurrent_imports_of_same_csv_produce_one_lead_and_one_lead_captured_event`
+(`tests/integration/test_import_leads.py`) — two genuinely independent
+`asyncpg` connections (two real concurrent calls to
+`scripts/import_leads.py::run()`, not two coroutines sharing one connection)
+race to import an identical single-row CSV; asserts exactly one `leads` row
+and one `lead.captured` event survive.
+
+**Correction 2 — checked empirically, not accepted as stated.** The
+instruction that reached this round said the `import_note` attribute
+envelope's `evidence: null` "fails the attribute validator (evidence must be
+a string; `""` allowed, null not)" and framed using `evidence: ""` instead
+as a defect the validator was catching. Ran the actual check before writing
+either version:
+
+```
+$ uv run python -c "
+import json, jsonschema
+schema = json.load(open('schemas/entities/attribute.json'))
+v = jsonschema.Draft202012Validator(schema)
+env = {'value': 'x', 'confidence': 1.0, 'evidence': None, 'source': 'human:manual_import', 'run_id': None, 'observed_at': '2026-08-25T00:00:00Z'}
+print('evidence=None errors:', [e.message for e in v.iter_errors(env)])
+print('evidence=empty-string errors:', [e.message for e in v.iter_errors(dict(env, evidence=''))])
+"
+evidence=None errors: []
+evidence=empty-string errors: []
+```
+
+Both pass. `evidence`'s schema type is `["string", "null"]`, and its own
+description names "human entry" as an explicit example of where `null` is
+correct — this is not a defect; entity-model.md §2 says so directly.
+**Implemented the requested change anyway** (`import_note`'s `evidence` is
+`""`, not `null`, in `scripts/import_leads.py`) — the instruction's outcome
+is harmless and was explicit — but recorded the real fact here rather than
+writing a fictitious "validator caught a defect" claim into this log: no
+defect exists, both values are valid, `""` was chosen by instruction, not by
+necessity.
+
+**`orchestrator/router.py` needed no change.** `"lead.captured":
+[JobSpec("leadgen.enrich")]` was already present from M0.3, added in
+anticipation of this milestone. The real wiring gap was
+`scripts/run_worker.py`'s `HANDLERS` dict, empty since M0.3 by design
+("no agents exist until M1.1+"). Fixed there:
+`HANDLERS["leadgen.enrich"] = leadgen.handle_enrich`. Confirmed end-to-end,
+not just unit-level, by
+`test_lead_captured_routes_through_worker_to_leadgen_and_emits_lead_enriched`
+(`tests/integration/test_leadgen.py`), which emits a real `lead.captured`
+event and drives it through the real `run_worker.dispatch_one_event` +
+`run_worker.process_one_job` + the real `HANDLERS` registration (only the
+Anthropic client is monkeypatched to a stub, via
+`monkeypatch.setitem(run_worker.HANDLERS, ...)` — the routing/dispatch/claim
+machinery itself is untouched) — asserting the enqueued job's `type` is
+literally `"leadgen.enrich"`, the job completes, and `lead.enriched` is the
+resulting event.
+
+**Judgment calls, logged as approved (not re-litigated), plus the
+`no partial write` mechanism and a status-model gap surfaced while
+implementing:**
+
+- **CSV's bare `linkedin_url` column → the contact's personal profile**, not
+  the company's — the one genuinely ambiguous column in an otherwise settled
+  contract (every other unprefixed column, `company_name`/`domain`, is
+  unambiguous).
+- **`ManualCsvProvider.verify_email()` is syntax-only** (regex check;
+  `INVALID` if malformed, `UNVERIFIED` otherwise, never `VALID` — a syntax
+  check alone can't confirm deliverability, and returning `VALID` from it
+  would be a guess wearing a confident label). No vendor adapter built.
+  `csv_path` is optional on `ManualCsvProvider.__init__` specifically so
+  `agents/leadgen.py` can construct an empty instance to reuse this
+  instance-independent method without a CSV to parse — its own discovery
+  data (`.errors`, companies, contacts) is simply empty in that case.
+- **`raw_research` fed to all three prompts is built from exactly what's
+  known** (company name/domain, contact name/title/LinkedIn, the
+  `import_note` attribute if present) — no web search/fetch tool exists yet
+  (out of scope for M1.1). The prompts are explicitly designed for input
+  this sparse (phase1-llm-boundary.md §2, §5's sparse fixtures): null values
+  and `insufficient_context: true` are the correct, honest output, not a
+  defect to work around.
+- **Per-field confidence gate:** an attribute envelope is written only if
+  `confidence >= pack.scoring.min_confidence_to_store` (0.4 in
+  `b2b-service-firms.yaml`) — phase1-llm-boundary.md §2's "code drops
+  anything below `enrichment.min_confidence` rather than storing a guess
+  with provenance that makes it look trustworthy." `insufficient_context`
+  itself is informational only — it does not block writing whatever
+  individual fields did clear the threshold, and does not route to
+  `lead.enrichment_failed` (that's reserved for real validation failure
+  after retries, not "the model found little evidence").
+- **`tech_signals`, `likely_responsibilities`, `inferred_pains` are each
+  stored as one array-valued envelope**, not per-item — these schema fields
+  carry a confidence per item (or, for `tech_signals`, none at all), not one
+  for the field, so there's no single model-supplied top-level confidence to
+  read. The envelope's `confidence` is the max across items (`tech_signals`
+  items are treated as confidence 1.0, since the schema already requires
+  each to cite `evidence` to be included at all); `evidence` is `null` for
+  these three (an aggregate of several items' individual reasoning has no
+  one quotable snippet).
+- **`lead.enrichment_failed.attempts` is fixed at 2** for an LLM validation
+  failure — `complete_json()`'s own internal retry-once-then-raise
+  (`_MAX_ATTEMPTS = 2`) is what "after retries" in this milestone's required
+  test means; agent-contracts.md's "after 3 attempts" language isn't
+  precisely defined at this milestone (it could mean job-level queue
+  retries, a distinct future escalation policy, or this) and wasn't
+  resolved by any prior decision. Flagged here rather than guessed
+  silently — revisit if a future milestone gives this a firmer
+  specification. `attempts=1` for the `no_domain` case (no LLM call was
+  ever attempted).
+- **"No partial write" is enforced by ordering, not a transaction wrapping
+  all three LLM calls:** `agents/leadgen.py::handle_enrich` runs all three
+  `complete_json()` calls to completion (or catches the first
+  `LLMValidationError`) *before* any write to `companies`, `contacts`, or
+  `leads.profile`. A company is never enriched with no matching contact
+  enrichment, or vice versa.
+- **Lead status has no dedicated "enriched" value** —
+  `migrations/0001_init.sql`'s `leads.status` enum has `enriching` and
+  `enrich_failed` but nothing for "enrichment succeeded, not yet scored."
+  `handle_enrich` sets `enriching` at the start and, on success, leaves it
+  there — the `lead.enriched` *event* is the success signal; qualification
+  (M1.2) is what will move a lead to `scored`. Not treated as a gap to fix
+  now: entity-model.md's status enum is locked schema, and inventing a new
+  status value wasn't asked for or needed by anything M1.1 builds.
+
+**Tests, matching the required list exactly, all against a real Postgres
+instance:**
+- Protected: `test_reimporting_same_csv_is_a_noop`,
+  `test_row_for_company_with_active_lead_emits_deferred_and_import_continues`,
+  `test_enrichment_writes_provenance_envelope_not_bare_scalar` (validates
+  every written envelope against the live `schemas/entities/attribute.json`
+  validator, not just "is a dict"; also asserts a below-threshold field —
+  `sub_industry`, stubbed at confidence 0 — was never written),
+  `test_concurrent_imports_of_same_csv_produce_one_lead_and_one_lead_captured_event`.
+- Standard: `test_row_missing_domain_or_email_is_rejected_others_still_import`,
+  `test_enrichment_failure_after_retries_emits_lead_enrichment_failed_no_partial_write`
+  (stub client that never returns valid JSON — a real `LLMValidationError`,
+  not simulated — asserts no `lead.enriched` event, empty `companies.attributes`,
+  `leads.profile` still null),
+  `test_lead_captured_routes_through_worker_to_leadgen_and_emits_lead_enriched`.
+- Plus `test_lead_with_no_company_emits_enrichment_failed_reason_no_domain` and
+  a `ManualCsvProvider()`-with-no-path sanity check, not explicitly required
+  but covering paths the milestone's own design introduced.
+

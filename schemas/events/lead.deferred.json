@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lead.deferred",
+  "description": "The target company already has an active lead; the single-thread rule (one_active_lead_per_company) blocked creation and a status='deferred' placeholder was inserted instead. A normal business outcome, not an error. Emitted by Lead Generation / scripts/import_leads.py. Consumed by a scheduled re-evaluation (orchestrator/schedules.py, not built yet).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lead_id", "company_id", "blocked_by_lead_id", "reason"],
+  "properties": {
+    "lead_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "company_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "blocked_by_lead_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "The active lead currently occupying this company. Null only in the narrow window where the blocking row could not be identified before the deferred insert (see repositories.create_lead)."
+    },
+    "reason": {
+      "enum": ["company_single_thread"]
+    }
+  }
+}

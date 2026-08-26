@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lead.enrichment_failed",
+  "description": "Lead Generation could not enrich a lead after retries. Nothing partial was written. Emitted by Lead Generation. Consumed by the human review queue (Slack integration, M1.3 — not built yet).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lead_id", "reason", "attempts", "last_error"],
+  "properties": {
+    "lead_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reason": {
+      "enum": ["no_domain", "provider_error", "email_invalid"]
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "last_error": {
+      "type": "string"
+    }
+  }
+}

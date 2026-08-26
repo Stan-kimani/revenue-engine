@@ -294,6 +294,16 @@ async def create_lead(
     propagating, so a future migration that (for example) lets the two
     indexes' exclusion lists drift apart can't turn into an unhandled
     exception here.
+
+    Concurrent-deferred-insert safety (migrations/0004, docs/decisions.md,
+    M1.1 Correction 1): a second caller racing to defer the SAME contact
+    against the SAME already-occupied company (e.g. two overlapping
+    scripts/import_leads.py runs over the same CSV) is resolved by the
+    `one_deferred_lead_per_contact` partial unique index, not by trusting the
+    caller to check first. The INSERT below targets that index with
+    `ON CONFLICT ... DO NOTHING`; when the conflict fires, the existing
+    deferred row is re-read and returned instead — both racing callers
+    converge on the same lead row, never two.
     """
     try:
         row = await conn.fetchrow(
@@ -336,6 +346,8 @@ async def create_lead(
                     f"""
                     INSERT INTO leads ({_LEAD_INSERT_COLUMNS})
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    ON CONFLICT (contact_id) WHERE status = 'deferred' AND deleted_at IS NULL
+                    DO NOTHING
                     RETURNING *
                     """,
                     contact_id,
@@ -350,6 +362,20 @@ async def create_lead(
                     budget_band.value if budget_band else None,
                     budget_source.value if budget_source else None,
                 )
+                if deferred_row is None:
+                    # Lost the race: a concurrent caller's deferred insert for
+                    # this exact contact committed first and this one was
+                    # skipped by ON CONFLICT DO NOTHING (migrations/0004).
+                    # Re-read the row it created rather than insert a second
+                    # one.
+                    deferred_row = await conn.fetchrow(
+                        """
+                        SELECT * FROM leads
+                        WHERE contact_id = $1 AND status = 'deferred' AND deleted_at IS NULL
+                        LIMIT 1
+                        """,
+                        contact_id,
+                    )
         except asyncpg.PostgresError as inner_exc:
             return LeadCreationResult(
                 lead=None,
@@ -359,7 +385,23 @@ async def create_lead(
                 error=str(inner_exc),
             )
 
-        assert deferred_row is not None
+        if deferred_row is None:
+            # Should be unreachable: ON CONFLICT DO NOTHING only fires when a
+            # deferred row for this contact already exists, so the re-read
+            # above must find it. Not asserted — a concurrency-sensitive path
+            # failing here should surface as a typed, loggable result, not a
+            # bare AssertionError.
+            return LeadCreationResult(
+                lead=None,
+                deferred=False,
+                failed=True,
+                blocked_by_lead_id=blocking["id"] if blocking else None,
+                error=(
+                    "deferred insert conflicted on one_deferred_lead_per_contact "
+                    "but no existing deferred row was found on re-read"
+                ),
+            )
+
         return LeadCreationResult(
             lead=_row_to_lead(deferred_row),
             deferred=True,
@@ -379,6 +421,56 @@ async def update_lead_status(conn: asyncpg.Connection, lead_id: UUID, status: Le
     if row is None:
         raise RevenueEngineError(f"Lead not found: {lead_id}")
     return _row_to_lead(row)
+
+
+async def update_lead_profile(
+    conn: asyncpg.Connection, lead_id: UUID, profile: dict[str, Any]
+) -> Lead:
+    """Write the schema-validated leadgen/build_prospect_profile output
+    (migrations/0003) after all three enrichment LLM calls have succeeded —
+    agents/leadgen.py never calls this until it holds all three, so a lead
+    never has a partial/inconsistent profile written (M1.1, "no partial
+    write" requirement)."""
+    row = await conn.fetchrow(
+        "UPDATE leads SET profile = $2::jsonb, updated_at = now() WHERE id = $1 RETURNING *",
+        lead_id,
+        _dump_json(profile),
+    )
+    if row is None:
+        raise RevenueEngineError(f"Lead not found: {lead_id}")
+    return _row_to_lead(row)
+
+
+async def get_active_or_deferred_lead_by_contact(
+    conn: asyncpg.Connection, contact_id: UUID
+) -> Lead | None:
+    """The most recent non-terminal lead for a contact — 'new', 'deferred',
+    or anywhere in between (excludes converted/disqualified/unsubscribed/
+    dormant). Used by scripts/import_leads.py as a re-import idempotency
+    PRE-CHECK: an optimisation that avoids re-running create_lead (and the
+    enrichment work its lead.captured event would trigger) for a row that's
+    already in the pipeline.
+
+    This is explicitly NOT the thing that makes re-import safe under
+    concurrency — check-then-act has an inherent race window. The actual
+    guarantee is structural: `one_active_lead_per_contact` /
+    `one_active_lead_per_company` (migrations/0001) for the active case, and
+    `one_deferred_lead_per_contact` (migrations/0004) for the deferred case.
+    A caller that loses a race against this pre-check still gets a typed,
+    idempotent outcome from create_lead() (DuplicateActiveLeadError, or the
+    re-read deferred row) rather than a duplicate."""
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM leads
+        WHERE contact_id = $1
+          AND status NOT IN ('converted', 'disqualified', 'unsubscribed', 'dormant')
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        contact_id,
+    )
+    return _row_to_lead(row) if row else None
 
 
 # ============================================================================
@@ -685,6 +777,46 @@ async def get_agent_run(conn: asyncpg.Connection, run_id: UUID) -> AgentRun | No
     return _row_to_agent_run(row) if row else None
 
 
+async def get_latest_agent_run(
+    conn: asyncpg.Connection,
+    *,
+    agent: str,
+    prompt_id: str,
+    trigger_event: UUID | None,
+    status: AgentRunStatus,
+) -> AgentRun | None:
+    """Recovers the agent_runs.id that a just-completed core/llm.py::
+    complete_json() call wrote, since complete_json() itself returns only the
+    parsed output dict (M1.1, docs/decisions.md — chosen over changing
+    complete_json()'s return contract).
+
+    Safe to call immediately after a `complete_json()` call in the same
+    handler because each `(agent, prompt_id, trigger_event)` is written by at
+    most one in-flight call at a time: jobs are claimed exclusively (SELECT
+    ... FOR UPDATE SKIP LOCKED, core/queue.py) and `trigger_event` is the
+    causation_id of the event that triggered this specific job, so no other
+    worker is writing a row with the same three values concurrently.
+    `ORDER BY created_at DESC LIMIT 1` also makes this correct across a
+    crash-and-retry (a reclaimed job re-running the same call would insert a
+    second row for the same trigger_event; this always returns the most
+    recent one, which is the caller's own)."""
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM agent_runs
+        WHERE agent = $1 AND prompt_id = $2
+          AND trigger_event IS NOT DISTINCT FROM $3
+          AND status = $4
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        agent,
+        prompt_id,
+        trigger_event,
+        status.value,
+    )
+    return _row_to_agent_run(row) if row else None
+
+
 # ============================================================================
 # Row -> model mapping
 # ============================================================================
@@ -740,6 +872,7 @@ def _row_to_lead(row: asyncpg.Record) -> Lead:
         problem_statement=row["problem_statement"],
         pain_category=PainCategory(row["pain_category"]) if row["pain_category"] else None,
         team_size_band=TeamSizeBand(row["team_size_band"]) if row["team_size_band"] else None,
+        profile=json.loads(row["profile"]) if row["profile"] is not None else None,
         first_touched_at=row["first_touched_at"],
         last_activity_at=row["last_activity_at"],
         created_at=row["created_at"],

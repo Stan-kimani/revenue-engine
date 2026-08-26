@@ -1,0 +1,3 @@
+company_name,domain,contact_first_name,contact_last_name,contact_email,contact_title,linkedin_url,source_note
+Acme Ops,acme-ops-fixture.example,Jordan,Reyes,jordan@acme-ops-fixture.example,COO,https://linkedin.com/in/jordan-reyes-fixture,Met at a local ops meetup; mentioned manual intake process
+Solstice Agency,solstice-agency-fixture.example,Priya,Nair,priya@solstice-agency-fixture.example,Founder,,

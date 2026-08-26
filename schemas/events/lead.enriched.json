@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "lead.enriched",
+  "description": "Lead Generation finished enrichment for a lead: company/contact attributes and, when grounded, a prospect profile were written with full provenance. Emitted by Lead Generation. Consumed by Qualification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lead_id", "contact_id", "company_id", "fields_enriched", "email_status", "run_id"],
+  "properties": {
+    "lead_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "contact_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "company_id": {
+      "type": ["string", "null"],
+      "format": "uuid"
+    },
+    "fields_enriched": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Names of the attribute-envelope fields actually written (post confidence-threshold filtering) across company and contact, e.g. ['industry', 'employee_band', 'seniority']. Never includes a field that was dropped for low confidence."
+    },
+    "email_status": {
+      "enum": ["unverified", "valid", "risky", "invalid", "bounced", "suppressed"]
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "agent_runs.id of the leadgen/build_prospect_profile call, the final of the three LLM calls this event follows."
+    }
+  }
+}
