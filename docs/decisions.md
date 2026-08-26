@@ -1754,3 +1754,61 @@ instance:**
   a `ManualCsvProvider()`-with-no-path sanity check, not explicitly required
   but covering paths the milestone's own design introduced.
 
+## 2026-08-26 — M1.1 NOT VERIFIED gap closed: concurrency stability + real-model sparse-input golden test
+
+**Context:** two items were left NOT VERIFIED at M1.1 close (docs/verification-loop.md
+§7): the concurrent-import test had only been run once, and every M1.1 LLM call had
+only ever run against a stub — `build_prospect_profile`, the call that produces
+`personalization_anchors` (the only facts `sales/draft_initial_outreach.md` is
+permitted to assert), had never met a real model on genuinely sparse, CSV-only input.
+
+**Decision 1 — concurrency stability:**
+`tests/integration/test_import_leads.py::test_concurrent_imports_of_same_csv_produce_one_lead_and_one_lead_captured_event`
+run three times consecutively, same discipline as M0.3's concurrent-claim test. All
+three: PASSED (0.79s, 0.75s, 0.77s). No flake.
+
+**Decision 2 — added `tests/golden/test_leadgen_sparse.py` + `tests/fixtures/leadgen_sparse.csv`,**
+driving the real chain (`ManualCsvProvider` → `enrich_company` → `enrich_decision_maker`
+→ `build_prospect_profile`, three real `complete_json()` calls) on a fixture row with
+only the required CSV columns (`company_name`, `domain`, `contact_email`) plus a
+content-free `source_note`.
+
+**The fixture as first written was invalidated by its own company name.** The original
+row used `Thornbridge Facilities Group` / `thornbridgefacilities-fixture.example` — the
+literal word "Facilities" in both the name and domain is real, quotable context under
+`enrich_company.md` rule 1, and rule 4 explicitly permits a capped-confidence inference
+"from adjacent facts." The first real-model run returned `industry: "Facilities
+Management"` (not null), failing the test's blanket assertion that `industry,
+sub_industry, business_model, employee_band` are all null. Eight follow-up runs against
+the original fixture confirmed this wasn't one-off: `industry` and `employee_band` stayed
+null every time, but `business_model` was populated in 5 of 8 runs at confidence 0.4–0.6
+(twice at 0.6, exceeding rule 4's stated 0.5 cap), always citing the company name text
+itself as evidence. This is the model doing exactly what the prompt tells it to do —
+extract from real context, cap confidence on an inference — not fabrication. The fixture,
+not the model or the prompt, was the defect: a "genuinely sparse" fixture must not
+smuggle in a real, checkable industry signal through the one field (company name) that's
+always present. Renamed the fixture to `Thornbridge Meridian Group` /
+`thornbridgemeridian-fixture.example` — a plausible but industry-neutral name — and kept
+everything else (required-fields-only row, blank title, uninformative `source_note`)
+unchanged.
+
+**Stability evidence:** with the corrected fixture, five standalone runs of the
+`enrich_company` call returned nulls across all six inferred fields
+(`industry`/`sub_industry`/`business_model`/`employee_band`/`revenue_signal`/
+`positioning_summary`) with `insufficient_context: true` every time. The full golden
+test (all three chained calls, plus the V9 no-email-regex check and the
+`personalization_anchors == []` / `insufficient_context: true` assertions on
+`build_prospect_profile`) was then run three times consecutively: PASSED all three
+(21.26s, 10.75s, 10.67s).
+
+**Consequence:** `tests/golden/test_leadgen_sparse.py::test_sparse_csv_row_yields_no_fabricated_facts`
+is the first real-model coverage of the anchor-fabrication risk on sparse CSV-only
+input — the gap this fixture and test exist to close. Full suite re-verified after
+both changes: 236 unit/contract/integration tests pass, 14/14 golden tests pass
+(13 prior + this one), `ruff check`/`ruff format --check` clean. The confidence-cap
+overshoot (0.6 against a stated 0.5 ceiling) observed on the original fixture is a
+real, minor prompt-calibration finding, logged here rather than silently dropped —
+worth a tightened wording pass on `enrich_company.md` rule 4 if it recurs elsewhere,
+but out of scope for this fix since the corrected fixture no longer exercises that
+inference path at all.
+
