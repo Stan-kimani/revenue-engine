@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "approval.denied",
+  "description": "A human rejected a gated action. Emitted by core/approvals.py::resolve(). Consumed by the ops notifier (Slack integration exists as of M1.3, but interactions/slack.py updates the original Slack message directly and synchronously as part of resolving the decision — no separate notifier job is wired for this event in M1.3).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approval_id", "decided_by", "reason"],
+  "properties": {
+    "approval_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "decided_by": {
+      "type": "string",
+      "description": "'human:<slack_user_id_or_name>'."
+    },
+    "reason": {
+      "type": ["string", "null"],
+      "maxLength": 2000,
+      "description": "The decider's stated reason, when given. Null is honest for a plain Reject click with no reason text captured — never invented."
+    }
+  }
+}

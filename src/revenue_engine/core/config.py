@@ -35,12 +35,13 @@ from typing import Any
 import jsonschema
 import yaml
 
-from ..db.models import Tier
+from ..db.models import ActionType, AutonomyLevel, Tier
 from .disqualifiers import parse_rule
 from .errors import ConfigError, DisqualifierRuleError
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_BASE_CONFIG_PATH = _REPO_ROOT / "config" / "base.yaml"
+_DEFAULT_THRESHOLDS_CONFIG_PATH = _REPO_ROOT / "config" / "thresholds.yaml"
 _DEFAULT_INDUSTRIES_DIR = _REPO_ROOT / "config" / "industries"
 _DEFAULT_PACK_SCHEMA_PATH = _REPO_ROOT / "schemas" / "entities" / "industry_pack.json"
 _REPLY_CLASSIFICATION_SCHEMA_PATH = _REPO_ROOT / "schemas" / "outputs" / "reply_classification.json"
@@ -48,6 +49,8 @@ _OBJECTION_RESPONSE_SCHEMA_PATH = _REPO_ROOT / "schemas" / "outputs" / "objectio
 
 _WEIGHT_SUM_TOLERANCE = 0.001
 _REQUIRED_TIERS = frozenset(t.value for t in Tier)
+_REQUIRED_ACTION_TYPES = frozenset(a.value for a in ActionType)
+_VALID_ON_EXPIRY = frozenset({"cancel", "escalate"})
 
 
 # ============================================================================
@@ -67,6 +70,35 @@ class QueueConfig:
 class LLMConfig:
     timeout_s: float
     max_client_retries: int
+
+
+@dataclass(frozen=True)
+class ApprovalExpiryPolicy:
+    """One `action_type`'s row in event-catalog.md §7.1's expiry table.
+    `on_expiry`: 'cancel' (terminal — approval moves to `expired`) or
+    'escalate' (never cancels — stays `pending`, `approval.expired` fires
+    once as a notification signal only). `ttl_hours=None` means never
+    expires (`record_delete`: never autonomous, at any confidence, under any
+    config — CLAUDE.md §1 non-negotiable 8 / agent-contracts.md §5)."""
+
+    on_expiry: str
+    ttl_hours: float | None
+
+
+@dataclass(frozen=True)
+class ThresholdsConfig:
+    """`config/thresholds.yaml` — build-spec §2: "Autonomy thresholds (HITL
+    triggers)". Read by core/approvals.py, never hardcoded per call site
+    (CLAUDE.md §3)."""
+
+    autonomy_requires_approval: frozenset[AutonomyLevel]
+    """Which agent-contracts.md §0.4 levels create a BLOCKING pending
+    approval when passed to `request_approval()`. Config-driven per M1.2's
+    plan-approval Correction: A0 has no external side effects to gate, A1's
+    side effects are autonomous within config caps — approval_gates.py must
+    never hardcode "A2 and up" as a Python literal, so tightening this later
+    (e.g. requiring approval at A1 too) is a one-line config change."""
+    expiry: MappingProxyType[ActionType, ApprovalExpiryPolicy]
 
 
 @dataclass(frozen=True)
@@ -160,6 +192,7 @@ class IndustryPack:
 class Config:
     queue: QueueConfig
     llm: LLMConfig
+    thresholds: ThresholdsConfig
     models: MappingProxyType[Tier, ModelTierConfig]
     pack: IndustryPack
 
@@ -187,6 +220,7 @@ class Config:
 def load_config(
     *,
     base_config_path: Path = _DEFAULT_BASE_CONFIG_PATH,
+    thresholds_config_path: Path = _DEFAULT_THRESHOLDS_CONFIG_PATH,
     industries_dir: Path = _DEFAULT_INDUSTRIES_DIR,
     pack_schema_path: Path = _DEFAULT_PACK_SCHEMA_PATH,
     reply_classification_schema_path: Path = _REPLY_CLASSIFICATION_SCHEMA_PATH,
@@ -206,6 +240,7 @@ def load_config(
     queue_cfg = _parse_queue(raw_base, base_config_path)
     llm_cfg = _parse_llm(raw_base, base_config_path)
     models_cfg = _parse_models(raw_base, base_config_path)
+    thresholds_cfg = _parse_thresholds(thresholds_config_path)
 
     pack_name = (
         industry_pack or os.environ.get("INDUSTRY_PACK") or _autodetect_pack_name(industries_dir)
@@ -226,7 +261,9 @@ def load_config(
     )
 
     pack = _parse_pack(raw_pack)
-    return Config(queue=queue_cfg, llm=llm_cfg, models=models_cfg, pack=pack)
+    return Config(
+        queue=queue_cfg, llm=llm_cfg, thresholds=thresholds_cfg, models=models_cfg, pack=pack
+    )
 
 
 @cache
@@ -264,6 +301,70 @@ def _parse_llm(raw_base: dict[str, Any], base_config_path: Path) -> LLMConfig:
         )
     except (KeyError, TypeError) as exc:
         raise ConfigError(f"{base_config_path}: missing or malformed 'llm' block: {exc}") from exc
+
+
+def _parse_thresholds(thresholds_config_path: Path) -> ThresholdsConfig:
+    """`config/thresholds.yaml` is a top-level file, not nested in
+    `base.yaml`, so it gets its own read + fail-loud-if-missing, same
+    discipline as the pack itself."""
+    if not thresholds_config_path.is_file():
+        raise ConfigError(f"Thresholds config not found: {thresholds_config_path}")
+    raw = yaml.safe_load(thresholds_config_path.read_text())
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{thresholds_config_path}: expected a YAML mapping at the top level")
+
+    try:
+        approvals_raw = raw["approvals"]
+        autonomy_raw = approvals_raw["autonomy_requires_approval"]
+        expiry_raw = approvals_raw["expiry"]
+    except (KeyError, TypeError) as exc:
+        raise ConfigError(
+            f"{thresholds_config_path}: missing or malformed 'approvals' block: {exc}"
+        ) from exc
+
+    try:
+        autonomy_levels = frozenset(AutonomyLevel(v) for v in autonomy_raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{thresholds_config_path}: 'approvals.autonomy_requires_approval' contains an "
+            f"invalid autonomy level: {exc}"
+        ) from exc
+
+    found_action_types = set(expiry_raw.keys()) if isinstance(expiry_raw, dict) else set()
+    if found_action_types != _REQUIRED_ACTION_TYPES:
+        raise ConfigError(
+            f"{thresholds_config_path}: 'approvals.expiry' must define exactly the action types "
+            f"{sorted(_REQUIRED_ACTION_TYPES)} (event-catalog.md §7.1), found "
+            f"{sorted(found_action_types)}"
+        )
+
+    expiry: dict[ActionType, ApprovalExpiryPolicy] = {}
+    for action_type_str, policy_raw in expiry_raw.items():
+        try:
+            on_expiry = policy_raw["on_expiry"]
+            ttl_hours = policy_raw["ttl_hours"]
+        except (KeyError, TypeError) as exc:
+            raise ConfigError(
+                f"{thresholds_config_path}: 'approvals.expiry.{action_type_str}' missing "
+                f"'on_expiry' or 'ttl_hours': {exc}"
+            ) from exc
+        if on_expiry not in _VALID_ON_EXPIRY:
+            raise ConfigError(
+                f"{thresholds_config_path}: 'approvals.expiry.{action_type_str}.on_expiry' must "
+                f"be one of {sorted(_VALID_ON_EXPIRY)}, got {on_expiry!r}"
+            )
+        if ttl_hours is not None and (not isinstance(ttl_hours, int | float) or ttl_hours <= 0):
+            raise ConfigError(
+                f"{thresholds_config_path}: 'approvals.expiry.{action_type_str}.ttl_hours' must "
+                f"be null or a positive number, got {ttl_hours!r}"
+            )
+        expiry[ActionType(action_type_str)] = ApprovalExpiryPolicy(
+            on_expiry=on_expiry, ttl_hours=float(ttl_hours) if ttl_hours is not None else None
+        )
+
+    return ThresholdsConfig(
+        autonomy_requires_approval=autonomy_levels, expiry=MappingProxyType(expiry)
+    )
 
 
 def _parse_models(

@@ -12,7 +12,11 @@ safe (each job is independent once claimed).
 
 Usage: uv run python scripts/run_worker.py
 Env: DATABASE_URL (required), WORKER_CONCURRENCY (default 4),
-     WORKER_POLL_INTERVAL_S (default 2), WORKER_RECLAIM_INTERVAL_S (default 30).
+     WORKER_POLL_INTERVAL_S (default 2), WORKER_RECLAIM_INTERVAL_S (default 30),
+     WORKER_EXPIRE_STALE_INTERVAL_S (default 300 — M1.3 approvals.expire_stale sweep),
+     SLACK_APP_TOKEN / SLACK_BOT_TOKEN / SLACK_APPROVAL_CHANNEL (M1.3 — the Socket
+     Mode listener logs a warning and does not start if SLACK_APP_TOKEN is unset;
+     every other loop, including the approval gate itself, is unaffected).
 """
 
 from __future__ import annotations
@@ -32,9 +36,11 @@ import asyncpg
 from dotenv import load_dotenv
 
 from revenue_engine.agents import leadgen, qualification
+from revenue_engine.core import approvals as core_approvals
 from revenue_engine.core import queue as core_queue
 from revenue_engine.db import repositories as repo
 from revenue_engine.db.models import Job
+from revenue_engine.integrations import slack as slack_integration
 from revenue_engine.orchestrator import router
 
 # Fixed, arbitrary key for the single-event-dispatcher advisory lock. Session
@@ -44,16 +50,19 @@ _EVENT_DISPATCH_LOCK_KEY = 72711583
 
 JobHandler = Callable[[asyncpg.Connection, Job], Awaitable[None]]
 
-# M1.1: leadgen is the first registered agent. M1.2 adds qualification.
-# orchestrator/router.py already routes "lead.captured" -> JobSpec("leadgen.enrich")
-# and both "lead.enriched"/"reply.received" -> JobSpec("qualification.score")
-# (M0.3, anticipating this) — the actual wiring gap was always here, not in
+# M1.1: leadgen is the first registered agent. M1.2 adds qualification. M1.3
+# adds the Slack approval-request notifier. orchestrator/router.py already
+# routes "lead.captured" -> JobSpec("leadgen.enrich"),
+# "lead.enriched"/"reply.received" -> JobSpec("qualification.score"), and
+# "approval.requested" -> JobSpec("slack.notify_approval_request") (M0.3/M1.3,
+# anticipating this) — the actual wiring gap was always here, not in
 # router.py. Tests may still populate their own additional entries to
 # exercise claim/execute/complete/fail/dead-letter machinery in isolation
 # from any real agent.
 HANDLERS: dict[str, JobHandler] = {
     "leadgen.enrich": leadgen.handle_enrich,
     "qualification.score": qualification.handle_score,
+    "slack.notify_approval_request": slack_integration.handle_notify_approval_request,
 }
 
 _STRUCTURED_FIELDS = (
@@ -267,6 +276,26 @@ async def run_reclaim_loop(
         await _wait_or_shutdown(shutdown, interval_s)
 
 
+async def run_expire_stale_loop(
+    pool: asyncpg.Pool, shutdown: asyncio.Event, interval_s: float
+) -> None:
+    """M1.3 deliverable 5: the scheduled job for
+    core/approvals.py::expire_stale(), following run_reclaim_loop's exact
+    shape immediately above (same while-not-shutdown / sweep / log / wait
+    pattern) — this milestone's build spec asked for "following the existing
+    scheduler pattern," not a new orchestrator/schedules.py module."""
+    while not shutdown.is_set():
+        async with pool.acquire() as conn, conn.transaction():
+            result = await core_approvals.expire_stale(conn)
+        if result.cancelled or result.escalated:
+            log.info(
+                "swept stale approval(s): %d cancelled, %d escalated",
+                len(result.cancelled),
+                len(result.escalated),
+            )
+        await _wait_or_shutdown(shutdown, interval_s)
+
+
 async def _wait_or_shutdown(shutdown: asyncio.Event, timeout_s: float) -> None:
     try:
         await asyncio.wait_for(shutdown.wait(), timeout=timeout_s)
@@ -292,6 +321,7 @@ async def main() -> int:
     concurrency = int(os.environ.get("WORKER_CONCURRENCY", "4"))
     poll_interval_s = float(os.environ.get("WORKER_POLL_INTERVAL_S", "2"))
     reclaim_interval_s = float(os.environ.get("WORKER_RECLAIM_INTERVAL_S", "30"))
+    expire_stale_interval_s = float(os.environ.get("WORKER_EXPIRE_STALE_INTERVAL_S", "300"))
 
     pool = await asyncpg.create_pool(database_url, min_size=1, max_size=concurrency + 2)
     shutdown = asyncio.Event()
@@ -312,6 +342,8 @@ async def main() -> int:
             run_event_dispatch_loop(pool, shutdown, poll_interval_s),
             run_job_loop(pool, worker_id, shutdown, poll_interval_s, concurrency),
             run_reclaim_loop(pool, shutdown, worker_id, reclaim_interval_s),
+            run_expire_stale_loop(pool, shutdown, expire_stale_interval_s),
+            slack_integration.run_socket_mode_listener(pool, shutdown),
         )
     finally:
         await pool.close()

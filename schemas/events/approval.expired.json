@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "approval.expired",
+  "description": "TTL passed with no decision (event-catalog.md §7.1). Emitted by core/approvals.py::expire_stale(). `action_taken` distinguishes the two branches §7.1 defines: 'cancelled' (terminal — the approval's status moved to 'expired') vs. 'escalated' (the approval is UNCHANGED, still 'pending' and still fully approvable/rejectable — this is a one-time notification signal only, per action_type's `on_expiry` policy in config/thresholds.yaml). Consumed by the ops notifier (digest — orchestrator/schedules.py, not built; M1.3 emits the event but does not build a recurring notifier for it).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approval_id", "action_type", "action_taken"],
+  "properties": {
+    "approval_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "action_type": {
+      "enum": [
+        "outreach_draft",
+        "sequence_step",
+        "proposal_send",
+        "pricing_discount",
+        "campaign_launch",
+        "icp_update",
+        "crm_merge",
+        "record_delete"
+      ]
+    },
+    "action_taken": {
+      "enum": ["cancelled", "escalated"]
+    }
+  }
+}

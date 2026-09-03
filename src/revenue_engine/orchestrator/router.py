@@ -55,6 +55,11 @@ ROUTES: dict[str, list[JobSpec]] = {
     # specific per-agent contract. Logged in docs/decisions.md.
     "meeting.requested": [JobSpec("sales.book_meeting")],
     "approval.granted": [JobSpec("sales.resume_gated_action")],
+    # M1.3: a gated action needs a human — post it to Slack. core/approvals.py
+    # itself never talks to Slack (fail-closed: request_approval() commits the
+    # pending row before this event is even emitted); this job is purely the
+    # notification side and can fail/dead-letter without affecting the row.
+    "approval.requested": [JobSpec("slack.notify_approval_request")],
 }
 
 
@@ -135,9 +140,16 @@ UNCONSUMED: dict[str, str] = {
     "campaign.assets_created": "Phase 4 (marketing, M4.2), not built.",
     # --- Operational/plumbing events (event-catalog.md §7) — never consumed
     # by domain agents by design; ops notifier is M1.3. ---
-    "approval.requested": "Consumed by the ops notifier. Slack integration is M1.3, not built.",
-    "approval.denied": "Consumed by the ops notifier. Slack integration is M1.3, not built.",
-    "approval.expired": "Consumed by the ops notifier. Slack integration is M1.3, not built.",
+    "approval.denied": (
+        "integrations/slack.py's interaction callback updates the Slack message directly and "
+        "synchronously as part of resolving the decision (M1.3) — no separate routed job. "
+        "Recurring digest notification is orchestrator/schedules.py, not built."
+    ),
+    "approval.expired": (
+        "M1.3 emits this (core/approvals.py::expire_stale) but does not build a recurring "
+        "notifier for it — event-catalog.md §7.1's daily digest is orchestrator/schedules.py, "
+        "not built. A one-time Slack post on expiry was judged out of this milestone's scope."
+    ),
     "job.dead_lettered": (
         "Emitted by core/queue.py itself (M0.3). Consumed by the ops notifier. "
         "Slack integration is M1.3, not built."

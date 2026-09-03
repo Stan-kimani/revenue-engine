@@ -108,3 +108,30 @@ class LLMValidationError(RevenueEngineError):
         super().__init__(
             f"'{prompt_id}' v{prompt_version} failed validation twice: {'; '.join(errors)}"
         )
+
+
+class ApprovalNotFoundError(RevenueEngineError):
+    """Raised by core/approvals.py::resolve() when `approval_id` matches no
+    row at all — distinct from ApprovalAlreadyDecidedError (M1.3)."""
+
+    def __init__(self, approval_id: object) -> None:
+        self.approval_id = approval_id
+        super().__init__(f"Approval not found: {approval_id}")
+
+
+class ApprovalAlreadyDecidedError(RevenueEngineError):
+    """Raised by core/approvals.py::resolve() when `approval_id` exists but
+    its status already left 'pending' — a resolved approval is never
+    re-decided (M1.3 plan deliverable 2). The database enforces this too
+    (migrations/0005's `approvals_forbid_redecision` trigger); this is the
+    typed surface for the ordinary, expected "already decided" case that
+    core/approvals.py::resolve()'s own `WHERE status='pending'` guard
+    produces (a clean zero-row UPDATE, not a trigger exception)."""
+
+    def __init__(self, approval_id: object, current_status: str) -> None:
+        self.approval_id = approval_id
+        self.current_status = current_status
+        super().__init__(
+            f"Approval {approval_id} already decided (status={current_status}), "
+            "cannot be re-decided"
+        )

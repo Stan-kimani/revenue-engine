@@ -1,0 +1,51 @@
+# config/thresholds.yaml
+# Autonomy thresholds (HITL triggers) — build-spec §2's repo layout names this
+# file for exactly this. Loaded and validated by core/config.py (M1.3). Read
+# by core/approvals.py — never hardcoded per call site (CLAUDE.md §3: tunable
+# numbers/weights/caps live in config, never as literals in code).
+
+approvals:
+  # Which agent-contracts.md §0.4 autonomy levels actually create a BLOCKING
+  # pending approval when passed to request_approval(). A0 has no external
+  # side effects to gate at all; A1's side effects are autonomous within
+  # config caps (e.g. a follow-up inside an already-approved sequence).
+  # A2 is "blocked until an approval token exists"; A3 means the agent never
+  # attempts automated execution in the first place — a human acts directly,
+  # so this code path is rarely reached for A3, but is included here (not
+  # hardcoded as "everything except A2") so a call site that DOES pass A3
+  # still gets gated rather than silently passing through.
+  autonomy_requires_approval: [A2, A3]
+
+  # event-catalog.md §7.1's expiry-policy table, verbatim. Per action_type:
+  #   on_expiry: cancel   -> terminal. status moves to 'expired'.
+  #   on_expiry: escalate -> never cancels. status stays 'pending';
+  #     approval.expired fires once (action_taken: "escalated") as a
+  #     notification signal only — the row remains fully approvable/
+  #     rejectable afterward, same as any other pending row.
+  #   ttl_hours: null -> never expires (record_delete: never autonomous, at
+  #     any confidence, under any config).
+  expiry:
+    outreach_draft:
+      on_expiry: cancel
+      ttl_hours: 72
+    sequence_step:
+      on_expiry: cancel
+      ttl_hours: 72
+    proposal_send:
+      on_expiry: escalate
+      ttl_hours: 24
+    pricing_discount:
+      on_expiry: escalate
+      ttl_hours: 24
+    campaign_launch:
+      on_expiry: escalate
+      ttl_hours: 168 # 7d
+    icp_update:
+      on_expiry: escalate
+      ttl_hours: 336 # 14d
+    crm_merge:
+      on_expiry: escalate
+      ttl_hours: 168 # 7d
+    record_delete:
+      on_expiry: escalate
+      ttl_hours: null

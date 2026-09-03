@@ -109,6 +109,49 @@ class Tier(StrEnum):
     DEEP = "deep"
 
 
+class AutonomyLevel(StrEnum):
+    """agent-contracts.md §0.4. A0/A1 never reach core/approvals.py in
+    practice (A0 has no external side effects to gate; A1's side effects are
+    autonomous within config caps); A2 is the level that actually blocks.
+    A3 means the agent never attempts automated execution at all — a human
+    acts directly, so this code path is never reached either. Kept as all
+    four values (not just A2/A3) because `request_approval()` takes the
+    caller's real level and decides whether to block from
+    `thresholds.yaml`'s `approvals.autonomy_requires_approval` list
+    (core/config.py), not from a hardcoded assumption baked into this enum."""
+
+    A0 = "A0"
+    A1 = "A1"
+    A2 = "A2"
+    A3 = "A3"
+
+
+class ActionType(StrEnum):
+    """Matches migrations/0001_init.sql's `approvals.action_type` CHECK
+    constraint and event-catalog.md §7.1's expiry-policy table exactly."""
+
+    OUTREACH_DRAFT = "outreach_draft"
+    SEQUENCE_STEP = "sequence_step"
+    PROPOSAL_SEND = "proposal_send"
+    PRICING_DISCOUNT = "pricing_discount"
+    CAMPAIGN_LAUNCH = "campaign_launch"
+    ICP_UPDATE = "icp_update"
+    CRM_MERGE = "crm_merge"
+    RECORD_DELETE = "record_delete"
+
+
+class ApprovalStatus(StrEnum):
+    """Matches migrations/0001_init.sql's `approvals.status` CHECK constraint
+    — 'granted'/'denied', not 'approved'/'rejected' (event-catalog.md's
+    `approval.granted`/`approval.denied` and orchestrator/router.py already
+    agree on this vocabulary)."""
+
+    PENDING = "pending"
+    GRANTED = "granted"
+    DENIED = "denied"
+    EXPIRED = "expired"
+
+
 class Company(BaseModel):
     id: UUID
     name: str
@@ -265,4 +308,30 @@ class AgentRun(BaseModel):
     status: AgentRunStatus
     error: str | None
     retry_count: int
+    created_at: datetime
+
+
+class Approval(BaseModel):
+    """One row of `approvals` (migrations/0001_init.sql + 0005, M1.3). The
+    gate CLAUDE.md §1 non-negotiable 8 requires: nothing downstream of an
+    A2/A3 action executes without a committed row here reaching
+    `status=granted`. `core/approvals.py::resolve()` and `expire_stale()` are
+    the ONLY code paths permitted to change `status` away from `pending` —
+    enforced doubly, in application code (`UPDATE ... WHERE status='pending'`)
+    and in the database itself (migrations/0005's `approvals_forbid_redecision`
+    trigger)."""
+
+    id: UUID
+    action_type: ActionType
+    payload: dict[str, Any]
+    requested_by_agent: str | None
+    status: ApprovalStatus
+    decided_by: str | None
+    token: str | None
+    expires_at: datetime | None
+    decided_at: datetime | None
+    decision_reason: str | None
+    correlation_id: UUID | None
+    causation_id: UUID | None
+    dedupe_key: str | None
     created_at: datetime

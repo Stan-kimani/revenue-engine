@@ -16,6 +16,7 @@ from revenue_engine.db.models import Tier
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _REAL_BASE_CONFIG = _REPO_ROOT / "config" / "base.yaml"
+_REAL_THRESHOLDS_CONFIG = _REPO_ROOT / "config" / "thresholds.yaml"
 _REAL_PACK_PATH = _REPO_ROOT / "config" / "industries" / "b2b-service-firms.yaml"
 _PACK_SCHEMA = _REPO_ROOT / "schemas" / "entities" / "industry_pack.json"
 _REPLY_SCHEMA = _REPO_ROOT / "schemas" / "outputs" / "reply_classification.json"
@@ -28,9 +29,21 @@ def _real_pack_data() -> dict:
     return data
 
 
-def _load(industries_dir: Path, *, industry_pack: str | None = None) -> Config:
+def _real_thresholds_data() -> dict:
+    data = yaml.safe_load(_REAL_THRESHOLDS_CONFIG.read_text())
+    assert isinstance(data, dict)
+    return data
+
+
+def _load(
+    industries_dir: Path,
+    *,
+    industry_pack: str | None = None,
+    thresholds_config_path: Path = _REAL_THRESHOLDS_CONFIG,
+) -> Config:
     return load_config(
         base_config_path=_REAL_BASE_CONFIG,
+        thresholds_config_path=thresholds_config_path,
         industries_dir=industries_dir,
         pack_schema_path=_PACK_SCHEMA,
         reply_classification_schema_path=_REPLY_SCHEMA,
@@ -332,3 +345,98 @@ def test_missing_base_config_raises(tmp_path: Path):
             objection_response_schema_path=_OBJECTION_SCHEMA,
             industry_pack="b2b-service-firms",
         )
+
+
+# ---------------------------------------------------------------------------
+# M1.3 — config/thresholds.yaml (approvals.autonomy_requires_approval,
+# approvals.expiry — event-catalog.md §7.1)
+# ---------------------------------------------------------------------------
+
+
+def _write_thresholds(tmp_path: Path, data: dict) -> Path:
+    path = tmp_path / "thresholds.yaml"
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    return path
+
+
+def test_real_thresholds_config_loads_and_exposes_typed_accessors():
+    config = _load(_REAL_PACK_PATH.parent, industry_pack="b2b-service-firms")
+    from revenue_engine.db.models import ActionType, AutonomyLevel
+
+    assert config.thresholds.autonomy_requires_approval == frozenset(
+        {AutonomyLevel.A2, AutonomyLevel.A3}
+    )
+    assert set(config.thresholds.expiry.keys()) == set(ActionType)
+    assert config.thresholds.expiry[ActionType.RECORD_DELETE].ttl_hours is None
+    assert config.thresholds.expiry[ActionType.RECORD_DELETE].on_expiry == "escalate"
+    assert config.thresholds.expiry[ActionType.OUTREACH_DRAFT].ttl_hours == 72.0
+    assert config.thresholds.expiry[ActionType.OUTREACH_DRAFT].on_expiry == "cancel"
+
+
+def test_missing_thresholds_config_raises(tmp_path: Path):
+    with pytest.raises(ConfigError, match="not found"):
+        _load(
+            _REAL_PACK_PATH.parent,
+            industry_pack="b2b-service-firms",
+            thresholds_config_path=tmp_path / "missing.yaml",
+        )
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_when_thresholds_expiry_is_missing_an_action_type(tmp_path: Path):
+    data = _real_thresholds_data()
+    del data["approvals"]["expiry"]["record_delete"]
+    path = _write_thresholds(tmp_path, data)
+
+    with pytest.raises(ConfigError, match="record_delete"):
+        _load(
+            _REAL_PACK_PATH.parent, industry_pack="b2b-service-firms", thresholds_config_path=path
+        )
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_on_invalid_on_expiry_value(tmp_path: Path):
+    data = _real_thresholds_data()
+    data["approvals"]["expiry"]["outreach_draft"]["on_expiry"] = "ignore"
+    path = _write_thresholds(tmp_path, data)
+
+    with pytest.raises(ConfigError, match="on_expiry"):
+        _load(
+            _REAL_PACK_PATH.parent, industry_pack="b2b-service-firms", thresholds_config_path=path
+        )
+
+
+def test_refuses_to_boot_on_negative_ttl_hours(tmp_path: Path):
+    data = _real_thresholds_data()
+    data["approvals"]["expiry"]["outreach_draft"]["ttl_hours"] = -5
+    path = _write_thresholds(tmp_path, data)
+
+    with pytest.raises(ConfigError, match="ttl_hours"):
+        _load(
+            _REAL_PACK_PATH.parent, industry_pack="b2b-service-firms", thresholds_config_path=path
+        )
+
+
+def test_refuses_to_boot_on_invalid_autonomy_level(tmp_path: Path):
+    data = _real_thresholds_data()
+    data["approvals"]["autonomy_requires_approval"] = ["A2", "A9"]
+    path = _write_thresholds(tmp_path, data)
+
+    with pytest.raises(ConfigError, match="invalid autonomy level"):
+        _load(
+            _REAL_PACK_PATH.parent, industry_pack="b2b-service-firms", thresholds_config_path=path
+        )
+
+
+def test_null_ttl_hours_is_accepted_as_never_expires(tmp_path: Path):
+    data = _real_thresholds_data()
+    data["approvals"]["expiry"]["crm_merge"]["ttl_hours"] = None
+    path = _write_thresholds(tmp_path, data)
+
+    config = _load(
+        _REAL_PACK_PATH.parent, industry_pack="b2b-service-firms", thresholds_config_path=path
+    )
+
+    from revenue_engine.db.models import ActionType
+
+    assert config.thresholds.expiry[ActionType.CRM_MERGE].ttl_hours is None

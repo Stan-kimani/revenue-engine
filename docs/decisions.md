@@ -1937,3 +1937,149 @@ before the run.
 exist, per phase1-llm-boundary.md §6 — the prompt itself was not touched, per the
 explicit instruction not to tune it without real data.
 
+## 2026-09-03 — M1.3: the approvals gate (human-in-the-loop)
+
+**Context:** implements CLAUDE.md §1 non-negotiable 8, build-spec §0.7, agent-contracts.md
+§0.4. The plan surfaced four conflicts between the task text and the binding docs /
+already-shipped schema before any code was written; all four were resolved per explicit
+instruction (see the plan-approval turn) rather than picked silently:
+
+1. `approvals` already existed (migrations/0001_init.sql), pre-built to match
+   event-catalog.md §7.1's action_type list exactly — migration 0005 `ALTER`s it
+   (migrations are forward-only), never redefines it.
+2. Kept the shipped `granted`/`denied` vocabulary (matches the CHECK constraint,
+   event-catalog.md, and orchestrator/router.py's existing references) over the task
+   text's `approved`/`rejected` phrasing.
+3. `is_approved(conn, approval_id)` exactly as specified — no token parameter, even
+   though CLAUDE.md/agent-contracts.md/build-spec all describe "an approval token."
+   A `token` is still generated (`secrets.token_urlsafe(32)`) and stored on every row
+   (satisfies "a token exists" descriptively; migration 0001's `token UNIQUE` column
+   is finally populated), but the gate itself checks only `approval_id` + `status`.
+   Tightening this to require the token later is a one-line change to `is_approved()`,
+   not a migration — the column and the value are already there.
+4. Autonomy gating direction: agent-contracts.md §0.4's real semantics (A0 = no
+   external side effects to gate; A2 = approval required), not the task text's
+   inverted phrasing. Config-driven via `config/thresholds.yaml`'s
+   `approvals.autonomy_requires_approval` (default `[A2, A3]`) — `core/approvals.py`
+   never hardcodes a level comparison.
+
+**slack_sdk dependency — pinned, scoped down from the initially-resolved extra.**
+`slack_sdk[optional]>=3.27` (the SDK's own documented way to get Socket Mode) resolved
+to 22 packages including `boto3` and `SQLAlchemy` — unrelated optional installation-store
+backends, not anything Socket Mode itself needs. Switched to `slack_sdk>=3.27` +
+`aiohttp>=3.9` as two explicit, individually-justified dependencies (aiohttp is what
+`slack_sdk.socket_mode.aiohttp.SocketModeClient` actually requires) — 7 packages instead
+of 22, none of them AWS or database-adjacent. `slack_sdk`/`aiohttp` are used for Socket
+Mode transport only and do not appear anywhere in `core/` or `db/` — verified by
+`core/approvals.py` having zero Slack-related imports, which is what makes it fail
+closed (see below).
+
+**THE PROPERTY THAT MATTERS, architecturally:** `core/approvals.py::request_approval()`
+never talks to Slack. It inserts the `pending` row and emits `approval.requested`;
+`integrations/slack.py::handle_notify_approval_request` is a SEPARATE job, routed from
+that event (`orchestrator/router.py`'s `approval.requested` moved from `UNCONSUMED` to
+`ROUTES` this milestone), that posts to Slack. A Slack failure — down, unreachable,
+misconfigured, or the app deleted entirely — can only ever fail that notification job
+(retries, eventually dead-letters); it cannot touch the committed row. `is_approved()`
+reads `approvals` and nothing else. Per the explicit note on the plan-approval turn, the
+protected test proves this by asserting the row is still `pending` and `is_approved()`
+still returns `False` after the Slack client raises on every call — not by asserting the
+job dead-lettered, which would only prove the notification failed, not that nothing
+became executable.
+
+**Append-only enforced twice, deliberately redundant.** `resolve()`/`expire_stale()`'s
+own `UPDATE ... WHERE status = 'pending'` guard is sufficient for every code path that
+uses it (a second attempt affects zero rows — `ApprovalAlreadyDecidedError`, not a
+re-decision). Migration 0005 also adds a `BEFORE UPDATE` trigger
+(`approvals_forbid_redecision`) that rejects ANY update to an already-decided row,
+including a raw `UPDATE` that bypasses `db/repositories.py` entirely — verified live
+against a real Postgres instance (a raw `UPDATE approvals SET decided_by='hacker' ...`
+after a grant raises `CheckViolationError`) before writing the corresponding protected
+test. This is the milestone's own explicit design goal ("a future agent cannot route
+around it even by accident"), not the WHERE-guard alone.
+
+**Idempotent dedupe, not an error, on a duplicate pending request.** `dedupe_key`
+(new column) + a partial unique index (`one_pending_approval_per_dedupe_key`, same
+pattern as `one_active_lead_per_company`/`one_deferred_lead_per_contact`) — a second
+`request_approval()` call for the same still-pending logical action returns the
+EXISTING row rather than raising, matching this codebase's own established idiom
+(`emit_event`'s idempotency_key, `create_lead`'s deferred-row handling), not a new
+pattern invented for this milestone.
+
+**`request_approval()` always returns a real row, even when autonomy doesn't require
+approval.** A0/A1 actions get an immediately-`granted` row (`decided_by="system:auto"`),
+not `None` or a skipped insert — every call site gets something to log/reference
+regardless of level, and `is_approved()` never needs a special case for "this action
+type doesn't gate." `approval.requested` is NOT emitted for the auto-grant path (nothing
+needs a human); `approval.granted` is, for audit consistency.
+
+**event-catalog.md §7.1's escalate branch genuinely never cancels.** For
+`on_expiry: escalate` action_types (`proposal_send`, `pricing_discount`,
+`campaign_launch`, `icp_update`, `crm_merge`, `record_delete`), `expire_stale()` leaves
+`status='pending'` completely unchanged past the TTL — only `approval.expired`
+(`action_taken: "escalated"`) fires, exactly once per approval ever (idempotency_key has
+no attempt counter, so a later scheduler tick finding the same still-pending row is a
+clean no-op, not a repeated notification). `record_delete`'s `ttl_hours: null` means it
+is never swept at all — never autonomous, at any confidence, under any config.
+The recurring "still waiting" safety net event-catalog.md §7.1 describes (the daily
+digest) is `orchestrator/schedules.py`, explicitly not built this milestone.
+
+**Scope boundary on router.py's `approval.denied`/`approval.expired`:** both stay
+`UNCONSUMED`, reasons updated (no longer "Slack integration is M1.3, not built" — it now
+is). `approval.denied`'s real-time notification already happens synchronously inside
+`integrations/slack.py::handle_interaction_payload` (it updates the Slack message
+directly as part of resolving the decision) — no separate routed job needed.
+`approval.expired`'s one-time Slack post was judged out of scope: the digest is the
+documented recurring mechanism, and building an ad hoc one-off notifier for expiry
+alongside it would duplicate that eventual mechanism rather than lead into it.
+
+**agent-contracts.md §2 (qualification) is unaffected — this entry is here, not there,
+because M1.3 touches shared infrastructure (`core/config.py`, `db/repositories.py`) that
+M1.2 also touches, not because M1.2's own contract changed.**
+
+**Tests:** `tests/unit/test_approvals_gating.py` (7, pure `requires_approval()`/
+`compute_expires_at()`, no DB — named `_gating` not `_approvals` to avoid a pytest
+module-name collision with `tests/integration/test_approvals.py`, same convention as
+M1.2's `test_qualification_scoring.py` vs `test_qualification.py`).
+`tests/unit/test_slack_blocks.py` (6, pure Block Kit rendering, no I/O) — includes a
+regression guard that normal-sized content is never summarised/truncated, and that an
+oversized payload is flagged rather than silently cut (Slack's ~3000-char block limit is
+a real, unsolved M1.4-era question this milestone surfaces rather than hides).
+`tests/unit/test_config.py` gained 8 tests for `thresholds.yaml`'s boot-time validation
+(missing action_type, invalid `on_expiry`, negative `ttl_hours`, invalid autonomy level,
+null-ttl acceptance). `tests/integration/test_approvals.py` (10) — protected: nothing
+executes without a committed granted row (tested by driving `is_approved()` directly
+through pending/denied/expired states, not just the happy path), a resolved approval
+rejected-by-the-database on redecision (both the typed-error path AND a raw SQL bypass
+hitting the trigger directly), an expired approval unapprovable afterward. Standard:
+dedupe idempotency, granted-exactly-once, expire_stale's cancel and escalate branches
+(including the "fires once across repeated ticks" check), record_delete never swept,
+auto-grant for non-gating levels. `tests/integration/test_slack.py` (8) — protected: the
+Slack-client-raises property described above, PLUS a matching case for a misconfigured
+`SLACK_APPROVAL_CHANNEL` (an equally real "misconfigured" manifestation, not just a
+hypothetical), PLUS a Slack failure during the interaction-callback's message update not
+blocking a resolve() that already committed. Standard: full path (request → stubbed
+Slack post → button click → resolve → `approval.granted`, exercised through the real
+module functions), reject path, skip-posting for an already-decided approval, and a
+double-click on a decided approval updating the message instead of raising.
+
+**Verification:** `scripts/migrate.py` applied migration 0005 cleanly against both
+`DATABASE_URL` (dev) and `TEST_DATABASE_URL`, confirmed idempotent on a second run.
+`ruff check`/`ruff format --check` clean. `mypy --strict` on `core/`+`db/` clean
+(`core/approvals.py` is in that strict scope; `integrations/slack.py` passes plain
+`mypy` too). Full suite: 311 passed (up from 269 before this milestone — +42: 7+6+8
+new unit tests, 18 new integration tests, minus none removed). `pytest -m protected
+--collect-only` — 70 protected tests (up from 62), confirmed every one this milestone's
+plan required exists. Post-suite `schema_migrations` integrity check against the
+persistent session-local `DATABASE_URL` Postgres shows exactly 5 rows (0001-0005) and
+zero rows in `approvals` — nothing from this milestone's manual smoke-testing or
+automated tests leaked into the dev database; all of it stayed on `TEST_DATABASE_URL`
+(confirmed empty after the suite too).
+
+**Consequence:** M1.4 (Sales agent, send path) is the first real caller of
+`request_approval()`/`is_approved()`. Not started this milestone, per explicit
+instruction — no sales agent, no send path, no `orchestrator/schedules.py` (the daily
+digest), no "lead returns to prior status" logic (`core/approvals.py`/
+`integrations/slack.py` never touch `leads`; that's Sales's job when it eventually
+consumes `approval.expired`).
+

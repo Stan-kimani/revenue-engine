@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "approval.requested",
+  "description": "A gated action needs a human (agent-contracts.md §0.4 A2/A3, CLAUDE.md §1 non-negotiable 8). Emitted by core/approvals.py::request_approval() only when the caller's autonomy_level actually requires blocking approval (config-driven, config/thresholds.yaml). Consumed by the router -> a job that posts to Slack (integrations/slack.py) — never by core/approvals.py itself, which never talks to Slack (fail-closed: a Slack outage can only fail that job, never the committed pending row).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approval_id", "action_type", "lead_id", "expires_at"],
+  "properties": {
+    "approval_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "action_type": {
+      "enum": [
+        "outreach_draft",
+        "sequence_step",
+        "proposal_send",
+        "pricing_discount",
+        "campaign_launch",
+        "icp_update",
+        "crm_merge",
+        "record_delete"
+      ]
+    },
+    "lead_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "Present when the action is lead-scoped (read from payload['lead_id'] by convention). Null for account-wide actions (icp_update, campaign_launch)."
+    },
+    "expires_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Null means this action_type never expires (event-catalog.md §7.1: record_delete)."
+    }
+  }
+}

@@ -27,8 +27,11 @@ from ..core.errors import (
     RevenueEngineError,
 )
 from .models import (
+    ActionType,
     AgentRun,
     AgentRunStatus,
+    Approval,
+    ApprovalStatus,
     BudgetBand,
     BudgetSource,
     Company,
@@ -917,6 +920,149 @@ async def get_latest_agent_run(
 
 
 # ============================================================================
+# Approvals (M1.3) — the human-in-the-loop gate, CLAUDE.md §1 non-negotiable 8.
+# ============================================================================
+
+
+async def insert_approval(
+    conn: asyncpg.Connection,
+    *,
+    action_type: ActionType,
+    payload: dict[str, Any],
+    requested_by_agent: str | None,
+    token: str,
+    expires_at: datetime | None,
+    correlation_id: UUID | None,
+    causation_id: UUID | None,
+    dedupe_key: str | None,
+) -> Approval:
+    """Insert a new `pending` approval, idempotent on `dedupe_key`: a second
+    request for the same still-pending logical action (e.g. a retried job
+    re-requesting approval for the same draft) returns the EXISTING row
+    rather than creating a duplicate or raising — the same idempotency
+    posture as `emit_event`'s idempotency_key and `create_lead`'s deferred-row
+    handling (both already established in this codebase), not a new pattern.
+    `dedupe_key IS NULL` always inserts a fresh row: migrations/0005's
+    partial unique index excludes NULL, so there is nothing to conflict on.
+    """
+    if dedupe_key is not None:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO approvals (action_type, payload, requested_by_agent, status, token,
+                                    expires_at, correlation_id, causation_id, dedupe_key)
+            VALUES ($1, $2::jsonb, $3, 'pending', $4, $5, $6, $7, $8)
+            ON CONFLICT (dedupe_key) WHERE status = 'pending' AND dedupe_key IS NOT NULL
+            DO NOTHING
+            RETURNING *
+            """,
+            action_type.value,
+            _dump_json(payload),
+            requested_by_agent,
+            token,
+            expires_at,
+            correlation_id,
+            causation_id,
+            dedupe_key,
+        )
+        if row is not None:
+            return _row_to_approval(row)
+        existing = await conn.fetchrow(
+            "SELECT * FROM approvals WHERE dedupe_key = $1 AND status = 'pending'", dedupe_key
+        )
+        assert existing is not None
+        return _row_to_approval(existing)
+
+    row = await conn.fetchrow(
+        """
+        INSERT INTO approvals (action_type, payload, requested_by_agent, status, token,
+                                expires_at, correlation_id, causation_id, dedupe_key)
+        VALUES ($1, $2::jsonb, $3, 'pending', $4, $5, $6, $7, NULL)
+        RETURNING *
+        """,
+        action_type.value,
+        _dump_json(payload),
+        requested_by_agent,
+        token,
+        expires_at,
+        correlation_id,
+        causation_id,
+    )
+    assert row is not None
+    return _row_to_approval(row)
+
+
+async def get_approval(conn: asyncpg.Connection, approval_id: UUID) -> Approval | None:
+    row = await conn.fetchrow("SELECT * FROM approvals WHERE id = $1", approval_id)
+    return _row_to_approval(row) if row else None
+
+
+async def resolve_approval(
+    conn: asyncpg.Connection,
+    approval_id: UUID,
+    *,
+    status: ApprovalStatus,
+    decided_by: str,
+    decision_reason: str | None,
+) -> Approval | None:
+    """`status` must be GRANTED or DENIED — expiry has its own function below,
+    since it's system-driven, not human-driven, and carries a different
+    `decided_by`. Returns None if `approval_id` doesn't exist or is no longer
+    `pending` (already decided) — the `WHERE status = 'pending'` guard is
+    what makes a second resolve() attempt a clean no-op instead of a
+    re-decision; migrations/0005's `approvals_forbid_redecision` trigger is
+    the backstop for any write path that skips this guard."""
+    row = await conn.fetchrow(
+        """
+        UPDATE approvals
+        SET status = $2, decided_by = $3, decision_reason = $4, decided_at = now()
+        WHERE id = $1 AND status = 'pending'
+        RETURNING *
+        """,
+        approval_id,
+        status.value,
+        decided_by,
+        decision_reason,
+    )
+    return _row_to_approval(row) if row else None
+
+
+async def expire_cancel_approval(
+    conn: asyncpg.Connection, approval_id: UUID, *, reason: str
+) -> Approval | None:
+    """The `on_expiry: cancel` branch of event-catalog.md §7.1: a terminal
+    transition to `expired`, `decided_by='system:expiry'`. The
+    `on_expiry: escalate` branch never calls this — an escalated approval
+    stays `pending` (core/approvals.py::expire_stale)."""
+    row = await conn.fetchrow(
+        """
+        UPDATE approvals
+        SET status = 'expired', decided_by = 'system:expiry', decision_reason = $2,
+            decided_at = now()
+        WHERE id = $1 AND status = 'pending'
+        RETURNING *
+        """,
+        approval_id,
+        reason,
+    )
+    return _row_to_approval(row) if row else None
+
+
+async def get_pending_approvals_older_than(
+    conn: asyncpg.Connection, *, action_type: ActionType, cutoff: datetime
+) -> list[Approval]:
+    """Pending rows of one `action_type` requested before `cutoff` — the
+    caller (core/approvals.py::expire_stale) computes `cutoff` from
+    `thresholds.yaml`'s per-action-type TTL, so this stays a plain
+    comparison, no interval arithmetic in Python call sites."""
+    rows = await conn.fetch(
+        "SELECT * FROM approvals WHERE status = 'pending' AND action_type = $1 AND created_at < $2",
+        action_type.value,
+        cutoff,
+    )
+    return [_row_to_approval(row) for row in rows]
+
+
+# ============================================================================
 # Row -> model mapping
 # ============================================================================
 
@@ -993,6 +1139,25 @@ def _row_to_lead_score(row: asyncpg.Record) -> LeadScore:
         model=row["model"],
         run_id=row["run_id"],
         scored_at=row["scored_at"],
+    )
+
+
+def _row_to_approval(row: asyncpg.Record) -> Approval:
+    return Approval(
+        id=row["id"],
+        action_type=ActionType(row["action_type"]),
+        payload=json.loads(row["payload"]),
+        requested_by_agent=row["requested_by_agent"],
+        status=ApprovalStatus(row["status"]),
+        decided_by=row["decided_by"],
+        token=row["token"],
+        expires_at=row["expires_at"],
+        decided_at=row["decided_at"],
+        decision_reason=row["decision_reason"],
+        correlation_id=row["correlation_id"],
+        causation_id=row["causation_id"],
+        dedupe_key=row["dedupe_key"],
+        created_at=row["created_at"],
     )
 
 

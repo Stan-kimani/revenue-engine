@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "approval.granted",
+  "description": "A human approved a gated action, or the action's autonomy level never required approval in the first place (core/approvals.py::request_approval()'s auto-grant path, decided_by='system:auto'). Emitted by core/approvals.py::resolve() or request_approval(). Consumed by the router -> JobSpec('sales.resume_gated_action') (orchestrator/router.py, M0.3 — the Sales agent that claims this job is M1.4, not built).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approval_id", "decided_by", "token"],
+  "properties": {
+    "approval_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "decided_by": {
+      "type": "string",
+      "description": "'human:<slack_user_id_or_name>' for a real decision, or 'system:auto' when the autonomy level didn't require approval."
+    },
+    "token": {
+      "type": "string",
+      "description": "The approval's stored capability token (approvals.token). Not currently required by is_approved() — approval_id alone gates — but generated and stored on every approval so tightening the gate to require it later is a one-line change, not a migration."
+    }
+  }
+}
