@@ -2083,3 +2083,128 @@ digest), no "lead returns to prior status" logic (`core/approvals.py`/
 `integrations/slack.py` never touch `leads`; that's Sales's job when it eventually
 consumes `approval.expired`).
 
+
+## 2026-09-15 — M1.4a: outreach drafting and the send path
+
+**Context:** implements `docs/deliverability.md` (the specification), agent-contracts.md §3's
+draft and send gates, and CLAUDE.md §1.8/§6. The plan surfaced eight decisions; all were
+answered on the plan-approval turn and are recorded here with their consequences.
+
+**The gate (core/sending.py).** Every send passes, immediately before the Gmail call and
+against live database state: from-domain, dev sandbox, health (§6 pause), message state,
+approval (`core.approvals.is_approved()` for the approval bound to *this* message, whose
+approved subject/body/recipient/sender must equal the row being sent), §7 content,
+suppression (address AND domain, plus `contacts.email_status`), caps (rolling 24h, rolling
+60 minutes, `min_gap_seconds`), and the recipient-local send window. `can_send()` returns a
+typed `SendDecision` naming the gate, reason, and disposition — never a bare bool. A gate that
+cannot be evaluated (config absent, table missing, database error) is itself a refusal
+(`gate=evaluation`); if even the refusal cannot be recorded, `authorize_send()` raises
+`SendGateEvaluationError` and the job dead-letters. Nothing ever proceeds on "unknown".
+
+**Race and double-send safety.** `authorize_send()` takes a transaction-scoped advisory lock
+on the sending domain, evaluates every gate, and reserves the message (`drafted -> sending`) in
+one commit; a reservation counts against the cap immediately. Verified by a test that runs two
+`authorize_send()` calls concurrently on two connections against a cap of 1: exactly one is
+authorized. A reservation that outlives `authorization_ttl_seconds` without a recorded outcome
+is marked `send_unknown` and never resent automatically — a duplicate email is irreversible, a
+stuck row is not. The send state machine is also enforced by a database trigger
+(`messages_send_state_transition`): no transition leads back to `drafted` or out of `sent`.
+
+**Stated plainly, not closed:** a suppression inserted in the milliseconds between the
+reservation commit and the Gmail API call cannot be caught. No database lock can span an
+external HTTP call. The window is bounded by `authorization_ttl_seconds` (60s maximum; in
+practice the call follows the commit immediately), not eliminated.
+
+**`integrations/gmail.py::send` accepts only a `SendAuthorization`**, which only
+`authorize_send()` can mint (module-private sentinel), is single-use, and expires. The dev
+sandbox redirect lives inside `send()` itself (CLAUDE.md §6): outside production, all mail goes
+to `DEV_SANDBOX_EMAIL`, an unset `ENV` counts as not production, and an unset sandbox address
+refuses. `send()` also refuses unless the authenticated Gmail account is the configured
+`from_address`. httpx, not google-api-python-client (synchronous; CLAUDE.md §4) — no new
+dependency.
+
+**Decision 1 — mql.** Pack key `outreach.draft_bands`, `[sql]` in the shipped pack. The router's
+`lead.qualified.*` now routes sql and mql to `sales.draft_outreach` (renamed from
+`sales.start_sequence`: the sequence state machine is M1.4b); the handler no-ops unless the band
+is listed. `lead.qualified.mql` was removed from `UNCONSUMED`; `tests/unit/test_router.py`'s two
+assertions encoding the old routing were updated to the approved routing (neither was
+protected).
+
+**Decision 2 — `allowed_email_statuses: [valid]`, fail closed.** Every current lead is
+`unverified` (`ManualCsvProvider.verify_email()` never returns `valid`), so **with this default
+M1.4a sends nothing to real prospects until an email verification provider exists.** That is
+correct behaviour, not a bug: bounces are what trigger the hard pause. Do not loosen the default
+to work around it. `suppressed`, `bounced` and `invalid` are refused regardless of this list
+(entity-model.md D6).
+
+**Decision 3 — no anchors, no draft.** `handle_draft_outreach` skips before any LLM call and
+records `outreach.blocked` (`reason=no_personalization_anchors`, `disposition=skipped`,
+`draft_id=null`). A generic email with no specific reason to contact someone is the
+low-quality outreach that generates complaints, and complaints kill the domain.
+**Consequence:** the sparse-input golden test (2026-08-27) showed CSV-only leads produce zero
+anchors, so **with current data nothing drafts at all.** The fix is better input at import time
+(a real reason to contact each lead captured in the CSV or by enrichment), not relaxing this rule.
+The draft path also skips, before spending a model call or a human's approval, when the contact's
+email status is not allowed or the address/domain is already suppressed; each is re-checked at
+send time regardless.
+
+**Decision 4 — timezone.** `default_recipient_timezone: America/New_York`, deliberately not
+`sender_timezone`: its job is the business hours to assume for a recipient who cannot be placed,
+and the ICP is US/UK/EU. Resolution order: a valid contact `timezone` attribute, then
+`companies.country` via `deliverability.country_timezones` (multi-zone countries map to their
+most populous business zone), then the default. An unplaceable recipient falls back to the
+default rather than being refused — refusing would block every CSV lead over an unknowable field.
+
+**Decision 5 — rolling 24h daily cap.** A calendar day allows 5 sends at 23:59 and 5 more at
+00:01; a rolling window never does.
+
+**Decision 6 — health sample floor.** Below 50 sends in the 7-day window, rates do not evaluate;
+2 hard bounces or 1 spam complaint pauses instead. At or above 50, §6's rates apply as written.
+Floor and counts are config; `docs/deliverability.md` §6 was updated to match. Bounce metrics
+count `hard_bounce` suppressions only (soft bounces are temporary), and only address-level rows,
+so an unsubscribe that also writes a domain-wide row is not double-counted. Until M1.4b ships
+bounce and unsubscribe detection, the only writers are `scripts/suppress.py` and future code —
+the metrics will read near zero, and there is no automated complaint detection at all (Postmaster
+Tools is a manual check).
+
+**Decision 7 — events, scripts, warnings.** New `sending.paused`, `sending.resumed` and
+`sending.health_warning` events (schemas, catalog entries, routed to
+`slack.notify_sending_alert`). `sending.health_warning` is the one event beyond the approved list:
+it is the trigger the approved once-daily Slack warning needs (idempotency key per metric per UTC
+day). `outreach.blocked` extended additively (reasons, `gate`, `detail`, `disposition`,
+`deferred_until`; `draft_id` nullable only for a draft-precondition skip). The pause is a
+`sending_pauses` row with a one-open-pause index and a CHECK requiring a resumer and non-blank
+reason. `scripts/resume_sending.py --by --reason` resumes and re-enqueues held drafts;
+`scripts/suppress.py` adds manual address/domain suppressions. Suppressions are append-only by
+trigger (§5: "never contactable again").
+
+**Refusal dispositions.** `deferred` (cap/window/gap: a new send job for the retry time plus
+jitter — not dropped, and not burned through retries into the dead-letter queue), `held` (health
+pause, pending approval, sandbox or evaluation failure: the message stays `drafted` until
+`resume_sending.py`), `blocked` (approval denied/mismatched, suppression, from-domain, content:
+terminal).
+
+**§7 content.** The opt-out sentence and physical address are config values appended at draft
+time, so the approval payload — and the Slack message a human approves — contains exactly what
+sends. `physical_address` is empty in the shipped config (pre-flight checklist item still open),
+so the content gate refuses every send until it is set. The opt-out wording in config is a default
+chosen for this milestone; edit it freely. The body word limit is enforced at draft time (V2);
+approved content cannot change afterwards without failing the approval-match check.
+
+**Also fixed while in core/approvals.py:** the comment claiming `approval.requested` is not
+re-emitted on the dedupe path (the code does emit; the idempotency key makes it a no-op), and a
+garbled `expire_stale` docstring example ("24h TTL — wait, escalates").
+
+**Tests.** A suite-wide autouse fixture in `tests/conftest.py` makes the real Gmail transport
+raise, so no test can consume the warmup account's 5/day even by forgetting to inject a stub.
+The 9 protected send tests (8 required plus approval-content mismatch) each call the send handler
+or gate directly, bypassing approval.granted, and assert refusal with the transport never called;
+all 9 were confirmed to FAIL when the gate is forced to allow everything (mutation check), so
+they depend on the gate rather than passing vacuously.
+
+**Consequence — before any real prospect is emailed:** (1) an email verification provider
+(decision 2); (2) import data that yields personalization anchors (decision 3); (3)
+`physical_address` set; (4) M1.4b, because the opt-out sentence asks recipients to reply "stop"
+and nothing processes replies yet — CAN-SPAM requires honouring opt-outs within 10 business days;
+(5) the §10 pre-flight checklist. A domain-wide suppression of a free-mail domain (e.g.
+`gmail.com`) would block every user of it — a write-side policy for M1.4b's unsubscribe handling.

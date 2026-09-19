@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "outreach.sent",
+  "description": "Gmail accepted an outbound email that passed every send gate (M1.4a). Emitted by agents/sales.py after core/sending.py recorded the provider message id. Idempotency: message:{provider_message_id}:sent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lead_id",
+    "message_id",
+    "provider_message_id",
+    "thread_id",
+    "sequence_step",
+    "campaign_id",
+    "approval_id",
+    "sent_at",
+    "dev_sandbox_redirect"
+  ],
+  "properties": {
+    "lead_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "message_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "provider_message_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "thread_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sequence_step": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "campaign_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "approval_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "dev_sandbox_redirect": {
+      "type": "boolean",
+      "description": "Additive (M1.4a). True when ENV != production and integrations/gmail.py delivered to DEV_SANDBOX_EMAIL instead of the real recipient (CLAUDE.md §6)."
+    }
+  }
+}

@@ -135,3 +135,32 @@ class ApprovalAlreadyDecidedError(RevenueEngineError):
             f"Approval {approval_id} already decided (status={current_status}), "
             "cannot be re-decided"
         )
+
+
+class SendGateEvaluationError(RevenueEngineError):
+    """Raised by core/sending.py when a send gate could not be evaluated AND
+    the refusal could not be recorded either (e.g. the database became
+    unreachable mid-check). The send does not happen; the job fails and
+    dead-letters with this error recorded (M1.4a: "never unknown, proceed")."""
+
+
+class SendNotAuthorizedError(RevenueEngineError):
+    """Raised by integrations/gmail.py::send() when handed an authorization
+    that was not minted by core/sending.py::authorize_send(), was already
+    used, or is older than deliverability.authorization_ttl_seconds."""
+
+
+class GmailSenderMismatchError(RevenueEngineError):
+    """The authenticated Gmail account is not the configured from_address
+    (docs/deliverability.md §1). Refused loudly — Gmail would otherwise send
+    as whichever account the OAuth token belongs to."""
+
+
+class GmailSendRejectedError(RevenueEngineError):
+    """Gmail definitively rejected the send (a 4xx response) — nothing was
+    delivered, so the message is marked send_failed, not send_unknown."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Gmail rejected the send ({status_code}): {detail}")

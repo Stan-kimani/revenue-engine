@@ -19,7 +19,8 @@
     "service_catalogue",
     "discovery",
     "channels",
-    "account_limits"
+    "account_limits",
+    "outreach"
   ],
   "properties": {
     "name": {
@@ -314,6 +315,21 @@
       "required": ["single_thread_per_company"],
       "properties": {
         "single_thread_per_company": { "type": "boolean" }
+      }
+    },
+    "outreach": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["draft_bands"],
+      "description": "Sales outreach settings (M1.4a).",
+      "properties": {
+        "draft_bands": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["sql", "mql", "warm", "cold"] },
+          "description": "Qualification bands Sales drafts first-touch outreach for. [sql] matches agent-contracts.md §2/§3; mql is nurture (Phase 4) unless deliberately added here."
+        }
       }
     }
   },

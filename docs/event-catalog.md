@@ -195,14 +195,46 @@ The lead is still scored (Learning needs the comparison) but bypasses the SQL ga
   "approval_id": "uuid|null", "sent_at": "timestamp" }
 ```
 Idempotency: `message:{provider_message_id}:sent`.
+**Additive at M1.4a:** `dev_sandbox_redirect` (bool) — true when ENV was not production and
+the message was delivered to the sandbox address instead of the real recipient.
 
 ### `outreach.blocked`
-**Emitted by** the send path when a gate refuses. **Consumed by** ops notifier.
+**Emitted by** the send path when a gate refuses, when a send fails or has an unknown
+outcome, or when a draft is skipped before any LLM call. **Consumed by** nothing routed
+(audit record; cap/window deferrals are too routine to alert on — a health pause alerts
+via `sending.paused` instead).
 ```json
-{ "lead_id": "uuid", "draft_id": "uuid",
-  "reason": "daily_cap_reached|suppressed_contact|missing_approval|dev_sandbox" }
+{ "lead_id": "uuid|null", "draft_id": "uuid|null",
+  "reason": "daily_cap_reached|suppressed_contact|missing_approval|dev_sandbox|...",
+  "gate": "approval|suppression|cap|window|from_domain|dev_sandbox|health|message_state|content|evaluation|transport|draft_precondition",
+  "detail": "string",
+  "disposition": "deferred|held|blocked|skipped|failed|unknown",
+  "deferred_until": "timestamp|null" }
 ```
 Every refusal is observable. A blocked send must never fail silently.
+
+**Extended additively at M1.4a** (version stays 1): `reason` gains `hourly_cap_reached`,
+`min_gap_not_elapsed`, `outside_send_window`, `suppressed_domain`,
+`email_status_not_allowed`, `wrong_from_domain`, `sending_paused`, `approval_mismatch`,
+`message_not_sendable`, `content_requirements_not_met`, `gate_evaluation_error`,
+`send_failed`, `send_outcome_unknown` and `no_personalization_anchors`; `gate`, `detail`,
+`disposition` and `deferred_until` are new fields. `draft_id` is null only for a
+`draft_precondition` skip, where no draft exists.
+
+### `sending.paused` / `sending.resumed` / `sending.health_warning` ← **deliverability §6**
+**Emitted by** the send gate (core/sending.py): `sending.paused` once when a health
+threshold is breached (sending stops entirely for the domain); `sending.health_warning` at
+most once per metric per UTC day when a warn threshold is crossed; `sending.resumed` when a
+human resumes with a recorded reason (scripts/resume_sending.py). **Consumed by** the Slack
+notifier.
+```json
+{ "sending_domain": "string", "pause_id": "uuid", "reason": "string", "metrics": {} }
+{ "sending_domain": "string", "pause_id": "uuid|null", "resumed_by": "string",
+  "reason": "string", "requeued_count": 0 }
+{ "sending_domain": "string", "metric": "bounce|spam_complaint|unsubscribe",
+  "value": 0.021, "warn_threshold": 0.02, "sends_in_window": 64, "window_days": 7 }
+```
+The pause itself is a database row, not this event: a Slack failure cannot resume sending.
 
 ### `reply.received`
 **Emitted by** the Gmail webhook route or the reconciliation job. **Consumed by** Sales.
@@ -430,7 +462,10 @@ Revisit only if the queue proves noisy in practice.
 | lead.routed_to_human | qualification | slack notifier |
 | outreach.drafted | sales | approvals / send job |
 | outreach.sent | sales | sequence scheduler, crm_sync |
-| outreach.blocked | send path | ops notifier |
+| outreach.blocked | send path | — (audit) |
+| sending.paused | send gate | slack notifier |
+| sending.resumed | send gate (human resume) | slack notifier |
+| sending.health_warning | send gate | slack notifier |
 | reply.received | api webhook / reconciler | sales |
 | reply.classified | sales | router |
 | deal.created | sales | crm_sync |

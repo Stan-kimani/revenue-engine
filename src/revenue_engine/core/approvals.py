@@ -154,11 +154,8 @@ async def request_approval(
         causation_id=causation_id,
         dedupe_key=dedupe_key,
     )
-    # Idempotent-dedupe path (repo.insert_approval returned an EXISTING
-    # pending row, same dedupe_key): don't re-emit approval.requested — the
-    # events table's own idempotency_key already makes this a no-op, but
-    # skipping the call entirely avoids a redundant round trip and log line
-    # for a job simply being retried.
+    # On the dedupe path (insert_approval returned an existing pending row),
+    # this emit is a no-op: the idempotency_key is per approval_id.
     lead_id = payload.get("lead_id")
     await emit(
         conn,
@@ -260,9 +257,10 @@ async def expire_stale(
 
     Only genuinely stale rows are touched: the cutoff query
     (`repo.get_pending_approvals_older_than`) is scoped per action_type to
-    that type's own configured TTL, so a `proposal_send` approval 30 hours
-    old is untouched (24h TTL — wait, escalates, doesn't cancel; see below)
-    while an `outreach_draft` approval 80 hours old is cancelled (72h TTL).
+    that type's own configured TTL: an `outreach_draft` approval 10 hours old
+    is untouched (72h TTL), one 80 hours old is cancelled, and a
+    `proposal_send` approval 30 hours old is escalated but stays pending (24h
+    TTL, on_expiry=escalate).
     """
     resolved_thresholds = thresholds if thresholds is not None else get_config().thresholds
     now = datetime.now(UTC)

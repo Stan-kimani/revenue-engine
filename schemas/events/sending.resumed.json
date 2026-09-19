@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sending.resumed",
+  "description": "A human resumed sending with a recorded reason, and held drafts were re-enqueued (M1.4a). Emitted by core/sending.py::resume_sending (scripts/resume_sending.py). Consumed by integrations/slack.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sending_domain",
+    "pause_id",
+    "resumed_by",
+    "reason",
+    "requeued_count"
+  ],
+  "properties": {
+    "sending_domain": {
+      "type": "string"
+    },
+    "pause_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "description": "Null when no pause was open (a requeue-only resume)."
+    },
+    "resumed_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "requeued_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

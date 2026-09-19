@@ -60,3 +60,79 @@ models:
     model: claude-opus-5
     input_cost_per_mtok: 5
     output_cost_per_mtok: 25
+
+# docs/deliverability.md §4 (send caps and pacing) and §6 (health thresholds).
+# Every number here is read at runtime by core/sending.py — none is hardcoded in
+# the send path. Loaded and validated by core/config.py; the worker refuses to
+# boot on an invalid block.
+deliverability:
+  sending_domain: getkimani.com
+  from_address: kimani@getkimani.com
+  daily_cap: 5 # rolling 24h, not a calendar day. Raised manually per the §3 warmup table.
+  hourly_cap: 3 # rolling 60 minutes
+  min_gap_seconds: 180 # minimum spacing between sends on the domain
+  jitter_seconds: 420 # random extra delay (0..jitter) added before every send attempt
+  send_window_start: "08:00" # recipient-local
+  send_window_end: "17:00"
+  send_days: [mon, tue, wed, thu, fri]
+  timezone_source: recipient
+  # Business hours to assume for a recipient we cannot place (no contact
+  # timezone, no mapped company country). This is NOT the sender's timezone:
+  # the ICP is US/UK/EU, so 08:00 wherever the sender sits is the wrong clock.
+  default_recipient_timezone: America/New_York
+  # companies.country -> timezone. Multi-zone countries map to their most
+  # populous business zone; a contact-level timezone attribute, when enrichment
+  # has one, takes precedence over this.
+  country_timezones:
+    US: America/New_York
+    CA: America/Toronto
+    UK: Europe/London
+    GB: Europe/London
+    IE: Europe/Dublin
+    DE: Europe/Berlin
+    FR: Europe/Paris
+    NL: Europe/Amsterdam
+    ES: Europe/Madrid
+    IT: Europe/Rome
+    SE: Europe/Stockholm
+    AU: Australia/Sydney
+    NZ: Pacific/Auckland
+    AE: Asia/Dubai
+    SG: Asia/Singapore
+    KE: Africa/Nairobi
+    ZA: Africa/Johannesburg
+  # contacts.email_status values the send gate accepts. Fail closed: with
+  # [valid] and no verification vendor yet, nothing sends to a real prospect.
+  # Do not add `unverified` to work around that — bounces trigger the §6 pause.
+  allowed_email_statuses: [valid]
+  # §7 message-level requirements, appended to every draft BEFORE approval so
+  # the approver sees exactly what sends, and re-checked at send time.
+  max_links: 1
+  opt_out_sentence: "If this isn't relevant, reply \"stop\" and I won't contact you again."
+  # CAN-SPAM requires a real postal address. Empty = the content gate refuses
+  # every send until it is set (deliverability.md §10 pre-flight checklist).
+  physical_address: ""
+  # Maximum seconds between a send being authorized (gates passed, reservation
+  # committed) and the Gmail call. Keeps the unavoidable commit-to-send window
+  # small; an older authorization is refused rather than used.
+  authorization_ttl_seconds: 60
+  gmail_timeout_seconds: 30 # per Gmail API request; a timeout is recorded as send_unknown, never retried
+  health:
+    window_days: 7
+    # Below this many sends in the window, rates are statistically meaningless
+    # (one bounce in 35 sends reads as 2.9%). Absolute counts apply instead.
+    sample_floor_sends: 50
+    below_floor_pause_counts:
+      hard_bounce: 2
+      spam_complaint: 1
+    # At or above the floor, §6's rates apply as written.
+    rates:
+      bounce:
+        warn: 0.02
+        pause: 0.03
+      spam_complaint:
+        warn: 0.0005
+        pause: 0.001
+      unsubscribe:
+        warn: 0.02
+        pause: 0.05

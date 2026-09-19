@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sending.health_warning",
+  "description": "A docs/deliverability.md §6 warn threshold was crossed (below the pause threshold). Emitted by core/sending.py at most once per metric per UTC day (idempotency key sending:{domain}:health_warning:{metric}:{date}). Consumed by integrations/slack.py. Rates are only evaluated at or above the configured sample floor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sending_domain",
+    "metric",
+    "value",
+    "warn_threshold",
+    "sends_in_window",
+    "window_days"
+  ],
+  "properties": {
+    "sending_domain": {
+      "type": "string"
+    },
+    "metric": {
+      "enum": [
+        "bounce",
+        "spam_complaint",
+        "unsubscribe"
+      ]
+    },
+    "value": {
+      "type": "number",
+      "minimum": 0
+    },
+    "warn_threshold": {
+      "type": "number",
+      "minimum": 0
+    },
+    "sends_in_window": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "window_days": {
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

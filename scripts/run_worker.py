@@ -35,7 +35,7 @@ from typing import Any
 import asyncpg
 from dotenv import load_dotenv
 
-from revenue_engine.agents import leadgen, qualification
+from revenue_engine.agents import leadgen, qualification, sales
 from revenue_engine.core import approvals as core_approvals
 from revenue_engine.core import queue as core_queue
 from revenue_engine.db import repositories as repo
@@ -63,6 +63,12 @@ HANDLERS: dict[str, JobHandler] = {
     "leadgen.enrich": leadgen.handle_enrich,
     "qualification.score": qualification.handle_score,
     "slack.notify_approval_request": slack_integration.handle_notify_approval_request,
+    # M1.4a: draft and send path. sales.send_outreach is enqueued directly (by
+    # handle_send_approved and by cap/window deferrals), never routed from an event.
+    "sales.draft_outreach": sales.handle_draft_outreach,
+    "sales.resume_gated_action": sales.handle_send_approved,
+    "sales.send_outreach": sales.handle_send_outreach,
+    "slack.notify_sending_alert": slack_integration.handle_notify_sending_alert,
 }
 
 _STRUCTURED_FIELDS = (

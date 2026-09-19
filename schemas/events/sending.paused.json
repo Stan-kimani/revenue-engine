@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sending.paused",
+  "description": "A docs/deliverability.md §6 health threshold was breached and the send path stopped entirely for the sending domain (M1.4a). Emitted once per pause by core/sending.py. Consumed by integrations/slack.py (alert). Sending stays stopped until scripts/resume_sending.py records a human resume with a reason.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sending_domain",
+    "pause_id",
+    "reason",
+    "metrics"
+  ],
+  "properties": {
+    "sending_domain": {
+      "type": "string"
+    },
+    "pause_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Snapshot of the window's counts and rates at the moment of the breach."
+    }
+  }
+}

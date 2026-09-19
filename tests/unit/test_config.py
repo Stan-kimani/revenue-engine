@@ -440,3 +440,69 @@ def test_null_ttl_hours_is_accepted_as_never_expires(tmp_path: Path):
     from revenue_engine.db.models import ActionType
 
     assert config.thresholds.expiry[ActionType.CRM_MERGE].ttl_hours is None
+
+
+# ---------------------------------------------------------------------------
+# M1.4a — config/base.yaml deliverability block (docs/deliverability.md §4/§6)
+# ---------------------------------------------------------------------------
+
+
+def _load_with_base(tmp_path: Path, base: dict) -> Config:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(yaml.safe_dump(base, sort_keys=False))
+    return load_config(
+        base_config_path=base_path,
+        thresholds_config_path=_REAL_THRESHOLDS_CONFIG,
+        industries_dir=_REAL_PACK_PATH.parent,
+        pack_schema_path=_PACK_SCHEMA,
+        reply_classification_schema_path=_REPLY_SCHEMA,
+        objection_response_schema_path=_OBJECTION_SCHEMA,
+        industry_pack="b2b-service-firms",
+    )
+
+
+def _real_base_data() -> dict:
+    data = yaml.safe_load(_REAL_BASE_CONFIG.read_text())
+    assert isinstance(data, dict)
+    return data
+
+
+def test_real_deliverability_block_matches_the_warmup_week_and_the_icp_clock():
+    config = _load(_REAL_PACK_PATH.parent, industry_pack="b2b-service-firms")
+    d = config.deliverability
+    assert d.daily_cap == 5
+    assert d.sending_domain == "getkimani.com"
+    assert d.default_recipient_timezone == "America/New_York"
+    assert {s.value for s in d.allowed_email_statuses} == {"valid"}
+    assert d.health.sample_floor_sends == 50
+    assert dict(d.health.below_floor_pause_counts) == {"hard_bounce": 2, "spam_complaint": 1}
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_without_a_deliverability_block(tmp_path: Path):
+    base = _real_base_data()
+    del base["deliverability"]
+    with pytest.raises(ConfigError, match="deliverability"):
+        _load_with_base(tmp_path, base)
+
+
+def test_refuses_to_boot_on_an_unknown_recipient_timezone(tmp_path: Path):
+    base = _real_base_data()
+    base["deliverability"]["default_recipient_timezone"] = "Mars/Olympus_Mons"
+    with pytest.raises(ConfigError, match="timezone"):
+        _load_with_base(tmp_path, base)
+
+
+def test_refuses_to_boot_on_an_inverted_send_window(tmp_path: Path):
+    base = _real_base_data()
+    base["deliverability"]["send_window_start"] = "17:00"
+    base["deliverability"]["send_window_end"] = "08:00"
+    with pytest.raises(ConfigError, match="send_window_start"):
+        _load_with_base(tmp_path, base)
+
+
+def test_refuses_to_boot_when_warn_exceeds_pause(tmp_path: Path):
+    base = _real_base_data()
+    base["deliverability"]["health"]["rates"]["bounce"] = {"warn": 0.05, "pause": 0.03}
+    with pytest.raises(ConfigError, match="warn <= pause"):
+        _load_with_base(tmp_path, base)

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "outreach.drafted",
+  "description": "Sales drafted a first-touch email and requested approval for it (M1.4a). Emitted by agents/sales.py::handle_draft_outreach only after the draft message row and its approval request are committed together. Nothing sendable follows from this event: sending is triggered only by approval.granted, and every send re-checks the approval in core/sending.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lead_id",
+    "draft_id",
+    "sequence_step",
+    "requires_approval",
+    "approval_id",
+    "prompt_version",
+    "run_id"
+  ],
+  "properties": {
+    "lead_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "draft_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "messages.id of the drafted (send_state='drafted') row."
+    },
+    "sequence_step": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "requires_approval": {
+      "type": "boolean"
+    },
+    "approval_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "prompt_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "agent_runs.id of the sales/draft_initial_outreach call."
+    }
+  }
+}

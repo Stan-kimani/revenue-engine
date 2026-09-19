@@ -11,9 +11,11 @@ Match precedence, in order — see `route()`:
   4. Prefix key in UNCONSUMED
 An exact UNCONSUMED entry deliberately outranks a prefix ROUTES match. This
 is what lets `"lead.qualified.*"` route to Sales while
-`lead.qualified.mql`/`lead.qualified.warm`/`lead.qualified.cold` — each
-listed explicitly in UNCONSUMED — are carved out of that same prefix instead
-of being silently swept into it.
+`lead.qualified.warm`/`lead.qualified.cold` — each listed explicitly in
+UNCONSUMED — are carved out of that same prefix instead of being silently
+swept into it. `lead.qualified.mql` is deliberately NOT carved out (M1.4a):
+it reaches sales.draft_outreach, which does nothing unless the lead's pinned
+pack lists mql in outreach.draft_bands (default [sql]).
 
 UNCONSUMED is a deliberate, reasoned allowlist (event-catalog.md §9
 "Verification rule"), not an oversight tracker: every event type documented
@@ -45,9 +47,11 @@ ROUTES: dict[str, list[JobSpec]] = {
     # Fan-out: qualification re-scores on engagement AND sales handles the
     # reply — one event, two independent consumers (event-catalog.md §R1).
     "reply.received": [JobSpec("qualification.score"), JobSpec("sales.handle_reply")],
-    # Prefix: lead.qualified.sql routes here; mql/warm/cold are carved out
-    # below via exact UNCONSUMED entries (see module docstring).
-    "lead.qualified.*": [JobSpec("sales.start_sequence")],
+    # Prefix: sql and mql route here; warm/cold are carved out below via exact
+    # UNCONSUMED entries. agents/sales.py::handle_draft_outreach acts only on
+    # bands in the pack's outreach.draft_bands (M1.4a). Renamed from
+    # sales.start_sequence: the sequence state machine is M1.4b, this job drafts.
+    "lead.qualified.*": [JobSpec("sales.draft_outreach")],
     "followup.due": [JobSpec("sales.send_followup")],
     # agent-contracts.md §3 lists meeting.requested as a Sales consume
     # trigger, though event-catalog.md's own section header says Sales
@@ -60,6 +64,11 @@ ROUTES: dict[str, list[JobSpec]] = {
     # pending row before this event is even emitted); this job is purely the
     # notification side and can fail/dead-letter without affecting the row.
     "approval.requested": [JobSpec("slack.notify_approval_request")],
+    # M1.4a: docs/deliverability.md §6 — a hard pause (and a resume, and a
+    # once-daily warn per metric) alerts Slack.
+    "sending.paused": [JobSpec("slack.notify_sending_alert")],
+    "sending.resumed": [JobSpec("slack.notify_sending_alert")],
+    "sending.health_warning": [JobSpec("slack.notify_sending_alert")],
 }
 
 
@@ -86,18 +95,22 @@ UNCONSUMED: dict[str, str] = {
         "is Learning (Phase 3), not built."
     ),
     "lead.qualified.cold": "No consumer — cold leads take no action (agent-contracts.md §2).",
-    "lead.qualified.mql": "Nurture is Phase 4, not built.",
     "lead.qualified.warm": "Nurture is Phase 4, not built.",
     "lead.routed_to_human": "Consumed by the Slack notifier. Slack integration is M1.3, not built.",
     "outreach.drafted": (
-        "Consumed by the approval gate (core/approvals.py) or a send job. "
-        "approvals.py is M1.3, not built."
+        "Informational (M1.4a): the approval request is created in the same transaction "
+        "as the draft, and sending is triggered only by approval.granted — so nothing may "
+        "consume this event as a send trigger."
     ),
     "outreach.sent": (
         "Consumed by the sequence scheduler (orchestrator/sequences.py, not in "
         "M0.3) and CRM Sync (Phase 2, not built)."
     ),
-    "outreach.blocked": "Consumed by the ops notifier. Slack integration is M1.3, not built.",
+    "outreach.blocked": (
+        "Recorded for audit (every refusal is observable), deliberately not routed to Slack: "
+        "cap and window deferrals are routine and would flood the channel. The one refusal "
+        "that needs a human now — a health pause — alerts via sending.paused."
+    ),
     "reply.classified": "Consumed by CRM Sync (Phase 2), not built.",
     "reply.unmatched": "Consumed by the Slack notifier (event-catalog.md §7.2). M1.3, not built.",
     "deal.created": "Consumed by CRM Sync (Phase 2), not built.",

@@ -335,3 +335,73 @@ class Approval(BaseModel):
     causation_id: UUID | None
     dedupe_key: str | None
     created_at: datetime
+
+
+class SendState(StrEnum):
+    """migrations/0006's `messages.send_state`. The allowed transitions are
+    enforced by a database trigger, not by this enum (see the migration)."""
+
+    DRAFTED = "drafted"
+    SENDING = "sending"
+    SENT = "sent"
+    SEND_FAILED = "send_failed"
+    SEND_UNKNOWN = "send_unknown"
+    BLOCKED = "blocked"
+
+
+class SuppressionReason(StrEnum):
+    UNSUBSCRIBE = "unsubscribe"
+    HARD_BOUNCE = "hard_bounce"
+    SOFT_BOUNCE = "soft_bounce"
+    SPAM_COMPLAINT = "spam_complaint"
+    HOSTILE_REPLY = "hostile_reply"
+    MANUAL = "manual"
+
+
+class Message(BaseModel):
+    """One row of `messages` (migrations/0001 + 0006)."""
+
+    id: UUID
+    lead_id: UUID | None
+    contact_id: UUID | None
+    campaign_id: UUID | None
+    direction: str
+    channel: str
+    provider_message_id: str | None
+    thread_id: str | None
+    subject: str | None
+    body_text: str | None
+    sequence_step: int | None
+    prompt_version: int | None
+    approval_id: UUID | None
+    from_address: str | None
+    to_address: str | None
+    send_state: SendState | None
+    send_started_at: datetime | None
+    send_block_reason: str | None
+    sent_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class Suppression(BaseModel):
+    """`address is None` means the whole `domain` is suppressed."""
+
+    id: UUID
+    address: str | None
+    domain: str | None
+    reason: SuppressionReason
+    source: str
+    expires_at: datetime | None
+    created_at: datetime
+
+
+class SendingPause(BaseModel):
+    id: UUID
+    sending_domain: str
+    reason: str
+    metrics: dict[str, Any]
+    paused_at: datetime
+    resumed_at: datetime | None
+    resumed_by: str | None
+    resume_reason: str | None

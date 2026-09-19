@@ -115,3 +115,20 @@ def test_decided_blocks_show_denial_reason_when_given():
     rendered = json.dumps(blocks)
     assert "Rejected" in rendered
     assert "Price is too aggressive for this account." in rendered
+
+
+def test_sending_pause_alert_says_nothing_will_send_and_shows_why():
+    from revenue_engine.integrations.slack import render_sending_alert
+
+    text = render_sending_alert(
+        "sending.paused",
+        {
+            "sending_domain": "getkimani.com",
+            "pause_id": str(uuid4()),
+            "reason": "hard_bounce count 2 >= 2 (below the 50-send sample floor)",
+            "metrics": {"sends": 12, "hard_bounce": 2},
+        },
+    )
+    assert "PAUSED" in text and "getkimani.com" in text
+    assert "hard_bounce count 2 >= 2" in text
+    assert "resume_sending" in text

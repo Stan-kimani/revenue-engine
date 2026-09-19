@@ -46,7 +46,12 @@ from .models import (
     LeadScore,
     LeadSource,
     LeadStatus,
+    Message,
     PainCategory,
+    SendingPause,
+    SendState,
+    Suppression,
+    SuppressionReason,
     TeamSizeBand,
     Tier,
 )
@@ -1063,6 +1068,342 @@ async def get_pending_approvals_older_than(
 
 
 # ============================================================================
+# Outreach messages, suppressions, sending pauses (M1.4a) — the send path.
+# Every function the send gate (core/sending.py) reads is here, and each one
+# reads live state: nothing is cached between a draft and a send.
+# ============================================================================
+
+
+async def insert_outbound_draft(
+    conn: asyncpg.Connection,
+    *,
+    lead_id: UUID,
+    contact_id: UUID,
+    campaign_id: UUID | None,
+    subject: str,
+    body_text: str,
+    sequence_step: int,
+    prompt_version: int,
+    from_address: str,
+    to_address: str,
+) -> Message:
+    row = await conn.fetchrow(
+        """
+        INSERT INTO messages (lead_id, contact_id, campaign_id, direction, channel, subject,
+                              body_text, sequence_step, prompt_version, from_address,
+                              to_address, send_state)
+        VALUES ($1, $2, $3, 'outbound', 'email', $4, $5, $6, $7, $8, $9, 'drafted')
+        RETURNING *
+        """,
+        lead_id,
+        contact_id,
+        campaign_id,
+        subject,
+        body_text,
+        sequence_step,
+        prompt_version,
+        from_address,
+        to_address,
+    )
+    assert row is not None
+    return _row_to_message(row)
+
+
+async def get_message(conn: asyncpg.Connection, message_id: UUID) -> Message | None:
+    row = await conn.fetchrow("SELECT * FROM messages WHERE id = $1", message_id)
+    return _row_to_message(row) if row else None
+
+
+async def get_outbound_message_for_lead_step(
+    conn: asyncpg.Connection, *, lead_id: UUID, sequence_step: int
+) -> Message | None:
+    """The existing outbound message for this lead and step, if any — the
+    draft handler's idempotency check (a redelivered lead.qualified.sql must
+    not draft a second email)."""
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM messages
+        WHERE lead_id = $1 AND sequence_step = $2 AND direction = 'outbound'
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        lead_id,
+        sequence_step,
+    )
+    return _row_to_message(row) if row else None
+
+
+async def set_message_approval(
+    conn: asyncpg.Connection, message_id: UUID, approval_id: UUID
+) -> None:
+    await conn.execute(
+        "UPDATE messages SET approval_id = $2, updated_at = now() WHERE id = $1",
+        message_id,
+        approval_id,
+    )
+
+
+async def lock_sending_domain(conn: asyncpg.Connection, sending_domain: str) -> None:
+    """Transaction-scoped advisory lock serialising gate evaluation +
+    reservation per sending domain: without it, two workers could both read
+    4 sends against a cap of 5 and both send. Released at commit/rollback."""
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", sending_domain.lower()
+    )
+
+
+async def count_sends_since(
+    conn: asyncpg.Connection, *, sending_domain: str, since: datetime
+) -> int:
+    """Every outbound message reserved or sent on the domain since `since` —
+    first touches and follow-ups alike (deliverability.md §4: "The cap counts
+    every outbound message on the domain"). A reservation ('sending') and an
+    ambiguous 'send_unknown' both count: either may have been delivered."""
+    count = await conn.fetchval(
+        """
+        SELECT count(*) FROM messages
+        WHERE direction = 'outbound'
+          AND send_state IN ('sending', 'sent', 'send_unknown')
+          AND lower(split_part(from_address::text, '@', 2)) = lower($1)
+          AND send_started_at >= $2
+        """,
+        sending_domain,
+        since,
+    )
+    return int(count)
+
+
+async def get_last_send_started_at(
+    conn: asyncpg.Connection, *, sending_domain: str
+) -> datetime | None:
+    value: datetime | None = await conn.fetchval(
+        """
+        SELECT max(send_started_at) FROM messages
+        WHERE direction = 'outbound'
+          AND send_state IN ('sending', 'sent', 'send_unknown')
+          AND lower(split_part(from_address::text, '@', 2)) = lower($1)
+        """,
+        sending_domain,
+    )
+    return value
+
+
+async def find_active_suppressions(
+    conn: asyncpg.Connection, *, address: str, domain: str, now: datetime
+) -> list[Suppression]:
+    """Address-level rows for `address`, plus domain-wide rows (address IS
+    NULL) for `domain`. Expired temporary suppressions are excluded."""
+    rows = await conn.fetch(
+        """
+        SELECT * FROM suppressions
+        WHERE (address = $1 OR (address IS NULL AND domain = $2))
+          AND (expires_at IS NULL OR expires_at > $3)
+        ORDER BY created_at
+        """,
+        address,
+        domain,
+        now,
+    )
+    return [_row_to_suppression(row) for row in rows]
+
+
+async def insert_suppression(
+    conn: asyncpg.Connection,
+    *,
+    address: str | None,
+    domain: str | None,
+    reason: SuppressionReason,
+    source: str,
+    expires_at: datetime | None = None,
+) -> Suppression:
+    row = await conn.fetchrow(
+        """
+        INSERT INTO suppressions (address, domain, reason, source, expires_at)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+        """,
+        address,
+        domain,
+        reason.value,
+        source,
+        expires_at,
+    )
+    assert row is not None
+    return _row_to_suppression(row)
+
+
+async def count_suppressions_since(
+    conn: asyncpg.Connection, *, reason: SuppressionReason, since: datetime
+) -> int:
+    """Address-level suppressions only: one unsubscribe may also write a
+    domain-wide row, and counting both would double-count one event in the
+    health metrics."""
+    count = await conn.fetchval(
+        """
+        SELECT count(*) FROM suppressions
+        WHERE reason = $1 AND address IS NOT NULL AND created_at >= $2
+        """,
+        reason.value,
+        since,
+    )
+    return int(count)
+
+
+async def get_open_sending_pause(
+    conn: asyncpg.Connection, *, sending_domain: str
+) -> SendingPause | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM sending_pauses WHERE sending_domain = $1 AND resumed_at IS NULL",
+        sending_domain,
+    )
+    return _row_to_sending_pause(row) if row else None
+
+
+async def open_sending_pause(
+    conn: asyncpg.Connection, *, sending_domain: str, reason: str, metrics: dict[str, Any]
+) -> tuple[SendingPause, bool]:
+    """Returns (pause, created). Idempotent on the one-open-pause-per-domain
+    index: a concurrent or repeated breach returns the existing open pause."""
+    row = await conn.fetchrow(
+        """
+        INSERT INTO sending_pauses (sending_domain, reason, metrics)
+        VALUES ($1, $2, $3::jsonb)
+        ON CONFLICT (sending_domain) WHERE resumed_at IS NULL DO NOTHING
+        RETURNING *
+        """,
+        sending_domain,
+        reason,
+        _dump_json(metrics),
+    )
+    if row is not None:
+        return _row_to_sending_pause(row), True
+    existing = await get_open_sending_pause(conn, sending_domain=sending_domain)
+    assert existing is not None
+    return existing, False
+
+
+async def resume_sending_pause(
+    conn: asyncpg.Connection, *, sending_domain: str, resumed_by: str, resume_reason: str
+) -> SendingPause | None:
+    row = await conn.fetchrow(
+        """
+        UPDATE sending_pauses
+        SET resumed_at = now(), resumed_by = $2, resume_reason = $3
+        WHERE sending_domain = $1 AND resumed_at IS NULL
+        RETURNING *
+        """,
+        sending_domain,
+        resumed_by,
+        resume_reason,
+    )
+    return _row_to_sending_pause(row) if row else None
+
+
+async def reserve_message_for_send(
+    conn: asyncpg.Connection, message_id: UUID, *, now: datetime
+) -> Message | None:
+    """drafted -> sending. None if the row is no longer 'drafted' — the
+    single transition that makes a second send of one message impossible."""
+    row = await conn.fetchrow(
+        """
+        UPDATE messages SET send_state = 'sending', send_started_at = $2, updated_at = now()
+        WHERE id = $1 AND send_state = 'drafted'
+        RETURNING *
+        """,
+        message_id,
+        now,
+    )
+    return _row_to_message(row) if row else None
+
+
+async def block_message(conn: asyncpg.Connection, message_id: UUID, *, reason: str) -> None:
+    await conn.execute(
+        """
+        UPDATE messages SET send_state = 'blocked', send_block_reason = $2, updated_at = now()
+        WHERE id = $1 AND send_state = 'drafted'
+        """,
+        message_id,
+        reason,
+    )
+
+
+async def mark_message_sent(
+    conn: asyncpg.Connection,
+    message_id: UUID,
+    *,
+    provider_message_id: str,
+    thread_id: str | None,
+    sent_at: datetime,
+) -> Message | None:
+    row = await conn.fetchrow(
+        """
+        UPDATE messages
+        SET send_state = 'sent', provider_message_id = $2, thread_id = $3, sent_at = $4,
+            updated_at = now()
+        WHERE id = $1 AND send_state = 'sending'
+        RETURNING *
+        """,
+        message_id,
+        provider_message_id,
+        thread_id,
+        sent_at,
+    )
+    return _row_to_message(row) if row else None
+
+
+async def mark_message_send_outcome(
+    conn: asyncpg.Connection, message_id: UUID, *, state: SendState, reason: str
+) -> None:
+    """sending -> send_failed | send_unknown."""
+    if state not in (SendState.SEND_FAILED, SendState.SEND_UNKNOWN):
+        raise ValueError(f"not a send outcome state: {state}")
+    await conn.execute(
+        """
+        UPDATE messages SET send_state = $2, send_block_reason = $3, updated_at = now()
+        WHERE id = $1 AND send_state = 'sending'
+        """,
+        message_id,
+        state.value,
+        reason,
+    )
+
+
+async def list_held_message_ids(conn: asyncpg.Connection, *, send_job_type: str) -> list[UUID]:
+    """Approved drafts still in 'drafted' with no pending/running send job —
+    the messages a health pause (or a sandbox/config fix) left held.
+    scripts/resume_sending.py re-enqueues exactly these."""
+    rows = await conn.fetch(
+        """
+        SELECT m.id FROM messages m
+        JOIN approvals a ON a.id = m.approval_id
+        WHERE m.direction = 'outbound' AND m.send_state = 'drafted' AND a.status = 'granted'
+          AND NOT EXISTS (
+              SELECT 1 FROM jobs j
+              WHERE j.type = $1 AND j.status IN ('pending', 'running')
+                AND j.payload->>'message_id' = m.id::text
+          )
+        ORDER BY m.created_at
+        """,
+        send_job_type,
+    )
+    return [row["id"] for row in rows]
+
+
+async def mark_lead_touched(conn: asyncpg.Connection, lead_id: UUID, *, at: datetime) -> None:
+    await conn.execute(
+        """
+        UPDATE leads
+        SET first_touched_at = COALESCE(first_touched_at, $2), last_activity_at = $2,
+            updated_at = now()
+        WHERE id = $1
+        """,
+        lead_id,
+        at,
+    )
+
+
+# ============================================================================
 # Row -> model mapping
 # ============================================================================
 
@@ -1210,4 +1551,55 @@ def _row_to_job(row: asyncpg.Record) -> Job:
         last_error=row["last_error"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_message(row: asyncpg.Record) -> Message:
+    return Message(
+        id=row["id"],
+        lead_id=row["lead_id"],
+        contact_id=row["contact_id"],
+        campaign_id=row["campaign_id"],
+        direction=row["direction"],
+        channel=row["channel"],
+        provider_message_id=row["provider_message_id"],
+        thread_id=row["thread_id"],
+        subject=row["subject"],
+        body_text=row["body_text"],
+        sequence_step=row["sequence_step"],
+        prompt_version=row["prompt_version"],
+        approval_id=row["approval_id"],
+        from_address=row["from_address"],
+        to_address=row["to_address"],
+        send_state=SendState(row["send_state"]) if row["send_state"] else None,
+        send_started_at=row["send_started_at"],
+        send_block_reason=row["send_block_reason"],
+        sent_at=row["sent_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_suppression(row: asyncpg.Record) -> Suppression:
+    return Suppression(
+        id=row["id"],
+        address=row["address"],
+        domain=row["domain"],
+        reason=SuppressionReason(row["reason"]),
+        source=row["source"],
+        expires_at=row["expires_at"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_sending_pause(row: asyncpg.Record) -> SendingPause:
+    return SendingPause(
+        id=row["id"],
+        sending_domain=row["sending_domain"],
+        reason=row["reason"],
+        metrics=json.loads(row["metrics"]),
+        paused_at=row["paused_at"],
+        resumed_at=row["resumed_at"],
+        resumed_by=row["resumed_by"],
+        resume_reason=row["resume_reason"],
     )

@@ -313,3 +313,10 @@ channels:
 
 account_limits:
   single_thread_per_company: true    # entity model R1 — enforced by DB constraint
+# ---------------------------------------------------------------------------
+# Outreach (M1.4a) — which qualification bands Sales drafts first-touch email for.
+# [sql] matches agent-contracts.md §2/§3. mql is nurture (Phase 4); add it here
+# only as a deliberate decision.
+# ---------------------------------------------------------------------------
+outreach:
+  draft_bands: [sql]

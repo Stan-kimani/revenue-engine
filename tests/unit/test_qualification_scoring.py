@@ -152,6 +152,7 @@ def _make_pack(
         discovery=MappingProxyType({}),
         channels=MappingProxyType({}),
         account_limits=MappingProxyType({}),
+        outreach_draft_bands=frozenset({"sql"}),
     )
 
 

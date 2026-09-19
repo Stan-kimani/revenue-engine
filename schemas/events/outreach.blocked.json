@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "outreach.blocked",
+  "description": "A send gate refused, a send failed or had an unknown outcome, or a draft was skipped before any LLM call (M1.4a). Every refusal is observable — a blocked send must never fail silently (event-catalog.md §3). The reason enum extends the catalog's original four values additively; `gate`, `detail`, `disposition` and `deferred_until` are additive fields. `draft_id` is null only when gate is draft_precondition (no draft was created).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lead_id",
+    "draft_id",
+    "reason",
+    "gate",
+    "detail",
+    "disposition",
+    "deferred_until"
+  ],
+  "properties": {
+    "lead_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "draft_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "reason": {
+      "enum": [
+        "missing_approval",
+        "approval_mismatch",
+        "suppressed_contact",
+        "suppressed_domain",
+        "email_status_not_allowed",
+        "daily_cap_reached",
+        "hourly_cap_reached",
+        "min_gap_not_elapsed",
+        "outside_send_window",
+        "wrong_from_domain",
+        "dev_sandbox",
+        "sending_paused",
+        "message_not_sendable",
+        "content_requirements_not_met",
+        "gate_evaluation_error",
+        "send_failed",
+        "send_outcome_unknown",
+        "no_personalization_anchors"
+      ]
+    },
+    "gate": {
+      "enum": [
+        "approval",
+        "suppression",
+        "cap",
+        "window",
+        "from_domain",
+        "dev_sandbox",
+        "health",
+        "message_state",
+        "content",
+        "evaluation",
+        "transport",
+        "draft_precondition"
+      ]
+    },
+    "detail": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "disposition": {
+      "enum": [
+        "deferred",
+        "held",
+        "blocked",
+        "skipped",
+        "failed",
+        "unknown"
+      ],
+      "description": "deferred: re-enqueued for deferred_until (cap/window). held: message stays drafted until scripts/resume_sending.py. blocked: terminal, message send_state='blocked'. skipped: no draft was created. failed/unknown: the Gmail call's outcome."
+    },
+    "deferred_until": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  }
+}

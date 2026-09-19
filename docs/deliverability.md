@@ -220,13 +220,28 @@ queued message.
 
 ## 6. Health thresholds and automatic pause
 
-Computed on a rolling 7-day window, evaluated before each send batch.
+Computed on a rolling 7-day window, evaluated immediately before every send.
+
+**Below 50 sends in the window, rates do not evaluate.** At warmup volume a rate is
+noise — one bounce in 35 sends reads as 2.9% — so absolute counts apply instead:
+
+| Below the sample floor | Hard pause |
+|---|---|
+| Hard bounces | 2 |
+| Spam complaints | 1 |
+
+**At or above 50 sends, the rates apply as written:**
 
 | Metric | Warn | Hard pause |
 |---|---|---|
 | Bounce rate | 2% | 3% |
 | Spam complaint rate | 0.05% | 0.1% |
 | Unsubscribe rate | 2% | 5% |
+
+The sample floor, the absolute counts and the rates all live in `config/base.yaml`
+(`deliverability.health`). Bounce rate counts hard bounces only; soft bounces are
+temporary suppressions (§5). A warn threshold alerts Slack at most once per metric per
+day and does not pause.
 
 **Hard pause stops the send path entirely** and alerts Slack. It does not
 throttle, degrade, or continue at reduced volume. It stops, and a human decides

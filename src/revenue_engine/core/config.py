@@ -26,16 +26,18 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import time
 from decimal import Decimal
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import jsonschema
 import yaml
 
-from ..db.models import ActionType, AutonomyLevel, Tier
+from ..db.models import ActionType, AutonomyLevel, EmailStatus, Tier
 from .disqualifiers import parse_rule
 from .errors import ConfigError, DisqualifierRuleError
 
@@ -51,6 +53,9 @@ _WEIGHT_SUM_TOLERANCE = 0.001
 _REQUIRED_TIERS = frozenset(t.value for t in Tier)
 _REQUIRED_ACTION_TYPES = frozenset(a.value for a in ActionType)
 _VALID_ON_EXPIRY = frozenset({"cancel", "escalate"})
+_WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+_REQUIRED_RATE_METRICS = frozenset({"bounce", "spam_complaint", "unsubscribe"})
+_VALID_BELOW_FLOOR_REASONS = frozenset({"hard_bounce", "spam_complaint"})
 
 
 # ============================================================================
@@ -99,6 +104,54 @@ class ThresholdsConfig:
     never hardcode "A2 and up" as a Python literal, so tightening this later
     (e.g. requiring approval at A1 too) is a one-line config change."""
     expiry: MappingProxyType[ActionType, ApprovalExpiryPolicy]
+
+
+@dataclass(frozen=True)
+class RateThreshold:
+    warn: float
+    pause: float
+
+
+@dataclass(frozen=True)
+class HealthConfig:
+    """docs/deliverability.md §6, with the sample floor added at M1.4a: below
+    `sample_floor_sends` sends in the window, rates are not evaluated and the
+    absolute `below_floor_pause_counts` apply instead."""
+
+    window_days: int
+    sample_floor_sends: int
+    below_floor_pause_counts: MappingProxyType[str, int]
+    """Keyed by suppression reason ('hard_bounce', 'spam_complaint')."""
+    rates: MappingProxyType[str, RateThreshold]
+    """Keyed by metric ('bounce', 'spam_complaint', 'unsubscribe')."""
+
+
+@dataclass(frozen=True)
+class DeliverabilityConfig:
+    """docs/deliverability.md §4 and §7 — every number the send path uses."""
+
+    sending_domain: str
+    from_address: str
+    daily_cap: int
+    hourly_cap: int
+    min_gap_seconds: int
+    jitter_seconds: int
+    send_window_start: time
+    send_window_end: time
+    send_days: frozenset[int]
+    """Weekday numbers, Monday=0 (datetime.weekday())."""
+    timezone_source: str
+    default_recipient_timezone: str
+    country_timezones: MappingProxyType[str, str]
+    allowed_email_statuses: frozenset[EmailStatus]
+    max_links: int
+    opt_out_sentence: str
+    physical_address: str
+    """Empty is a valid config value (not yet decided); the content gate
+    refuses every send while it is empty."""
+    authorization_ttl_seconds: int
+    gmail_timeout_seconds: int
+    health: HealthConfig
 
 
 @dataclass(frozen=True)
@@ -180,6 +233,10 @@ class IndustryPack:
     discovery: MappingProxyType[str, Any]
     channels: MappingProxyType[str, bool]
     account_limits: MappingProxyType[str, Any]
+    outreach_draft_bands: frozenset[str]
+    """`outreach.draft_bands` — which qualification bands Sales drafts
+    first-touch outreach for (M1.4a). Default in the shipped pack is [sql],
+    matching agent-contracts.md §2/§3; adding mql is a deliberate pack edit."""
 
     @property
     def is_draft(self) -> bool:
@@ -193,6 +250,7 @@ class Config:
     queue: QueueConfig
     llm: LLMConfig
     thresholds: ThresholdsConfig
+    deliverability: DeliverabilityConfig
     models: MappingProxyType[Tier, ModelTierConfig]
     pack: IndustryPack
 
@@ -240,6 +298,7 @@ def load_config(
     queue_cfg = _parse_queue(raw_base, base_config_path)
     llm_cfg = _parse_llm(raw_base, base_config_path)
     models_cfg = _parse_models(raw_base, base_config_path)
+    deliverability_cfg = _parse_deliverability(raw_base, base_config_path)
     thresholds_cfg = _parse_thresholds(thresholds_config_path)
 
     pack_name = (
@@ -262,7 +321,12 @@ def load_config(
 
     pack = _parse_pack(raw_pack)
     return Config(
-        queue=queue_cfg, llm=llm_cfg, thresholds=thresholds_cfg, models=models_cfg, pack=pack
+        queue=queue_cfg,
+        llm=llm_cfg,
+        thresholds=thresholds_cfg,
+        deliverability=deliverability_cfg,
+        models=models_cfg,
+        pack=pack,
     )
 
 
@@ -301,6 +365,121 @@ def _parse_llm(raw_base: dict[str, Any], base_config_path: Path) -> LLMConfig:
         )
     except (KeyError, TypeError) as exc:
         raise ConfigError(f"{base_config_path}: missing or malformed 'llm' block: {exc}") from exc
+
+
+def _parse_deliverability(raw_base: dict[str, Any], base_config_path: Path) -> DeliverabilityConfig:
+    """docs/deliverability.md §4/§6/§7. Refuses to boot on anything missing or
+    malformed — a send path running on a guessed cap or window is exactly the
+    failure this block exists to prevent."""
+
+    def fail(detail: str) -> ConfigError:
+        return ConfigError(f"{base_config_path}: 'deliverability' block: {detail}")
+
+    try:
+        d = raw_base["deliverability"]
+        health_raw = d["health"]
+        rates_raw = health_raw["rates"]
+
+        sending_domain = str(d["sending_domain"]).strip().lower()
+        from_address = str(d["from_address"]).strip().lower()
+        if not sending_domain or "@" in sending_domain:
+            raise fail(f"sending_domain must be a bare domain, got {sending_domain!r}")
+        if from_address.count("@") != 1:
+            raise fail(f"from_address must be an email address, got {from_address!r}")
+
+        ints = {
+            name: int(d[name])
+            for name in (
+                "daily_cap",
+                "hourly_cap",
+                "min_gap_seconds",
+                "jitter_seconds",
+                "max_links",
+                "authorization_ttl_seconds",
+                "gmail_timeout_seconds",
+            )
+        }
+        for name, value in ints.items():
+            if value < 0:
+                raise fail(f"{name} must be >= 0, got {value}")
+
+        start = time.fromisoformat(str(d["send_window_start"]))
+        end = time.fromisoformat(str(d["send_window_end"]))
+        if start >= end:
+            raise fail(f"send_window_start {start} must be before send_window_end {end}")
+
+        days_raw = d["send_days"]
+        unknown_days = [x for x in days_raw if str(x).lower() not in _WEEKDAYS]
+        if unknown_days or not days_raw:
+            raise fail(f"send_days must be a non-empty subset of {sorted(_WEEKDAYS)}")
+        send_days = frozenset(_WEEKDAYS[str(x).lower()] for x in days_raw)
+
+        timezone_source = str(d["timezone_source"])
+        if timezone_source != "recipient":
+            raise fail(f"timezone_source must be 'recipient', got {timezone_source!r}")
+
+        default_tz = str(d["default_recipient_timezone"])
+        country_timezones = {str(k).upper(): str(v) for k, v in d["country_timezones"].items()}
+        for tz_name in [default_tz, *country_timezones.values()]:
+            try:
+                ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise fail(f"unknown IANA timezone {tz_name!r}") from exc
+
+        allowed_statuses = frozenset(EmailStatus(s) for s in d["allowed_email_statuses"])
+        if not allowed_statuses:
+            raise fail("allowed_email_statuses must not be empty")
+
+        below_floor = {str(k): int(v) for k, v in health_raw["below_floor_pause_counts"].items()}
+        if set(below_floor) - _VALID_BELOW_FLOOR_REASONS or not below_floor:
+            raise fail(
+                "health.below_floor_pause_counts keys must be a non-empty subset of "
+                f"{sorted(_VALID_BELOW_FLOOR_REASONS)}"
+            )
+        if set(rates_raw) != _REQUIRED_RATE_METRICS:
+            raise fail(f"health.rates must define exactly {sorted(_REQUIRED_RATE_METRICS)}")
+        rates: dict[str, RateThreshold] = {}
+        for metric, pair in rates_raw.items():
+            threshold = RateThreshold(warn=float(pair["warn"]), pause=float(pair["pause"]))
+            if not 0 <= threshold.warn <= threshold.pause <= 1:
+                raise fail(f"health.rates.{metric} must satisfy 0 <= warn <= pause <= 1")
+            rates[metric] = threshold
+
+        window_days = int(health_raw["window_days"])
+        sample_floor = int(health_raw["sample_floor_sends"])
+        if window_days < 1 or sample_floor < 0:
+            raise fail("health.window_days must be >= 1 and sample_floor_sends >= 0")
+
+        return DeliverabilityConfig(
+            sending_domain=sending_domain,
+            from_address=from_address,
+            daily_cap=ints["daily_cap"],
+            hourly_cap=ints["hourly_cap"],
+            min_gap_seconds=ints["min_gap_seconds"],
+            jitter_seconds=ints["jitter_seconds"],
+            send_window_start=start,
+            send_window_end=end,
+            send_days=send_days,
+            timezone_source=timezone_source,
+            default_recipient_timezone=default_tz,
+            country_timezones=MappingProxyType(country_timezones),
+            allowed_email_statuses=allowed_statuses,
+            max_links=ints["max_links"],
+            opt_out_sentence=str(d["opt_out_sentence"]).strip(),
+            physical_address=str(d["physical_address"] or "").strip(),
+            authorization_ttl_seconds=ints["authorization_ttl_seconds"],
+            gmail_timeout_seconds=ints["gmail_timeout_seconds"],
+            health=HealthConfig(
+                window_days=window_days,
+                sample_floor_sends=sample_floor,
+                below_floor_pause_counts=MappingProxyType(below_floor),
+                rates=MappingProxyType(rates),
+            ),
+        )
+    except ConfigError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise fail(f"missing or malformed: {exc!r}") from exc
 
 
 def _parse_thresholds(thresholds_config_path: Path) -> ThresholdsConfig:
@@ -523,4 +702,5 @@ def _parse_pack(raw_pack: dict[str, Any]) -> IndustryPack:
         discovery=MappingProxyType(dict(raw_pack["discovery"])),
         channels=MappingProxyType(dict(raw_pack["channels"])),
         account_limits=MappingProxyType(dict(raw_pack["account_limits"])),
+        outreach_draft_bands=frozenset(raw_pack["outreach"]["draft_bands"]),
     )

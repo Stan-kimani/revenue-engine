@@ -333,3 +333,46 @@ async def run_socket_mode_listener(pool: asyncpg.Pool, shutdown: Any) -> None:
         await shutdown.wait()
     finally:
         await client.disconnect()
+
+
+# ============================================================================
+# Sending health alerts (M1.4a) — sending.paused / sending.resumed /
+# sending.health_warning. Notification only: the pause itself is the
+# sending_pauses row core/sending.py already committed; a Slack failure here
+# cannot resume or un-pause anything.
+# ============================================================================
+
+
+def render_sending_alert(event_type: str, payload: dict[str, Any]) -> str:
+    domain = payload.get("sending_domain", "?")
+    if event_type == "sending.paused":
+        return (
+            f":octagonal_sign: *Sending PAUSED on {domain}.* Nothing will send until a human "
+            f"resumes with a reason (scripts/resume_sending.py).\n*Why:* {payload.get('reason')}\n"
+            f"*Metrics:* ```{json.dumps(payload.get('metrics', {}), indent=2, sort_keys=True)}```"
+        )
+    if event_type == "sending.resumed":
+        return (
+            f":arrow_forward: *Sending resumed on {domain}* by `{payload.get('resumed_by')}`.\n"
+            f"*Reason:* {payload.get('reason')}\n"
+            f"Re-enqueued held drafts: {payload.get('requeued_count')}"
+        )
+    if event_type == "sending.health_warning":
+        return (
+            f":warning: *Deliverability warning on {domain}:* {payload.get('metric')} rate "
+            f"{float(payload.get('value', 0)):.4f} >= warn {payload.get('warn_threshold')} "
+            f"({payload.get('sends_in_window')} sends in {payload.get('window_days')} days). "
+            "Not paused yet."
+        )
+    raise ValueError(f"not a sending alert event type: {event_type}")
+
+
+async def handle_notify_sending_alert(
+    conn: asyncpg.Connection, job: Job, *, client: SlackWebClientProtocol | None = None
+) -> None:
+    resolved_client = client if client is not None else _default_web_client()
+    event = await repo.get_event(conn, UUID(job.payload["source_event_id"]))
+    if event is None:
+        raise RuntimeError(f"source event {job.payload['source_event_id']} not found")
+    text = render_sending_alert(event.type, event.payload)
+    await resolved_client.chat_postMessage(channel=_approval_channel(), text=text)
