@@ -31,7 +31,6 @@ from ..core.llm import AnthropicClientProtocol, complete_json
 from ..core.observability import TraceContext
 from ..db import repositories as repo
 from ..db.models import AgentRunStatus, Company, Contact, Job, LeadStatus
-from ..integrations.prospecting import ManualCsvProvider, ProspectingProvider
 
 ACTOR = "agent:leadgen"
 
@@ -41,22 +40,17 @@ async def handle_enrich(
     job: Job,
     *,
     client: AnthropicClientProtocol | None = None,
-    provider: ProspectingProvider | None = None,
 ) -> None:
     """`job.payload` is the copied `lead.captured` event payload plus
     `source_event_id`/`correlation_id` (core/queue.py::enqueue_for_event) —
     `causation_id` for anything this handler emits is `source_event_id`, the
     triggering event's own id.
 
-    `client`/`provider` are test injection points, same pattern as
-    core/llm.py::complete_json()'s own `client` parameter — `provider`
-    defaults to a fresh `ManualCsvProvider()` (no CSV path: only its
-    instance-independent `verify_email()` is used here; discovery itself is
-    out of scope, discovery-addendum.md §8).
+    `client` is a test injection point, the same pattern as
+    core/llm.py::complete_json()'s own `client` parameter. There is no
+    provider here any more: enrichment stopped verifying email at M1.4a
+    (see below).
     """
-    resolved_provider: ProspectingProvider = (
-        provider if provider is not None else ManualCsvProvider()
-    )
 
     lead_id = UUID(job.payload["lead_id"])
     contact_id = UUID(job.payload["contact_id"])
@@ -167,7 +161,11 @@ async def handle_enrich(
         await repo.update_lead_status(conn, lead_id, LeadStatus.ENRICH_FAILED)
         return
 
-    email_status = await resolved_provider.verify_email(contact.email)
+    # M1.4a: enrichment no longer verifies. Verification happens once, at
+    # import (scripts/import_leads.py -> integrations/email_verification.py),
+    # and contacts.email_status is write-once from there. Re-verifying here
+    # with the syntax-only CSV provider silently clobbered a paid verdict back
+    # to 'unverified' — see docs/decisions.md.
 
     company_run = await repo.get_latest_agent_run(
         conn,
@@ -227,7 +225,6 @@ async def handle_enrich(
     await repo.upsert_contact(
         conn,
         email=contact.email,
-        email_status=email_status,
         full_name=contact.full_name,
         first_name=contact.first_name,
         last_name=contact.last_name,
@@ -255,7 +252,8 @@ async def handle_enrich(
             "contact_id": str(contact_id),
             "company_id": str(company_id) if company_id else None,
             "fields_enriched": company_fields + contact_fields,
-            "email_status": email_status.value,
+            # The stored verdict, not a fresh check (upsert_contact preserves it).
+            "email_status": contact.email_status.value,
             "run_id": str(profile_run.id),
         },
         correlation_id=correlation_id,

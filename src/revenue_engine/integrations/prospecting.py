@@ -3,7 +3,7 @@ implementation, ManualCsvProvider.
 
 Discovery itself (the `discovery.requested` event flow) is out of scope until
 the ManualCsvProvider pilot clears its threshold (discovery-addendum.md §8) —
-`discover_companies`/`find_contacts`/`verify_email` exist here so
+`discover_companies`/`find_contacts` exist here so
 scripts/import_leads.py has one real implementation of the interface to
 import through, per this milestone's CSV contract, not because the discovery
 flow is being wired up. No business logic beyond CSV parsing lives here
@@ -15,12 +15,9 @@ required columns present?), not a judgment call.
 from __future__ import annotations
 
 import csv
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-
-from ..db.models import EmailStatus
 
 
 @dataclass(frozen=True)
@@ -53,9 +50,12 @@ class ContactStub:
 
 
 class ProspectingProvider(Protocol):
-    """discovery-addendum.md §3. Three operations, one interface, because a
-    single vendor typically provides all three; kept separate from a future
-    integrations/enrichment.py only if a second vendor is ever used for one.
+    """discovery-addendum.md §3, minus verification. `verify_email` used to
+    live here as a third operation; it moved to
+    integrations/email_verification.py at M1.4a (docs/decisions.md). Two
+    interfaces both claiming to verify an address is what let enrichment
+    silently clobber a paid verdict — discovery calls the verification
+    provider directly when it is built.
     """
 
     async def discover_companies(
@@ -65,8 +65,6 @@ class ProspectingProvider(Protocol):
     async def find_contacts(
         self, company: CompanyStub, target_titles: list[str], limit: int
     ) -> list[ContactStub]: ...
-
-    async def verify_email(self, email: str) -> EmailStatus: ...
 
 
 @dataclass(frozen=True)
@@ -80,13 +78,6 @@ class CsvRowError:
 
 
 _REQUIRED_COLUMNS = frozenset({"domain", "contact_email"})
-
-# Syntax-only — no real verification vendor exists in v1
-# (discovery-addendum.md §3: "V1 implementation: ManualCsvProvider ...
-# Nothing downstream knows which provider ran"). Deliberately conservative
-# rather than RFC 5322-complete; this only needs to catch obviously
-# malformed input, not replace a real verification vendor.
-_EMAIL_SYNTAX_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class ManualCsvProvider:
@@ -171,12 +162,3 @@ class ManualCsvProvider:
         if company.domain is None:
             return []
         return self._contacts_by_domain.get(company.domain, [])[:limit]
-
-    async def verify_email(self, email: str) -> EmailStatus:
-        """Syntax-only (docs/decisions.md, M1.1 judgment call) — no real
-        verification vendor exists in v1. Never returns VALID: a syntax
-        check alone cannot confirm deliverability, and returning VALID from
-        this would be a guess wearing a confident label."""
-        if not _EMAIL_SYNTAX_RE.match(email):
-            return EmailStatus.INVALID
-        return EmailStatus.UNVERIFIED

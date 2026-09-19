@@ -22,12 +22,26 @@ from pydantic import BaseModel
 
 
 class EmailStatus(StrEnum):
+    """Tiered by config/base.yaml's `deliverability.email_status_tiers`, which
+    core/config.py validates covers every member here exactly once — a new
+    member added without a tier fails the boot rather than defaulting to
+    sendable (M1.4a)."""
+
     UNVERIFIED = "unverified"
+    """No verdict yet. Never sendable, and the only status a verification may
+    overwrite: a real verdict is never re-verified (credits are per address)."""
     VALID = "valid"
     RISKY = "risky"
     INVALID = "invalid"
     BOUNCED = "bounced"
     SUPPRESSED = "suppressed"
+    CATCH_ALL = "catch_all"
+    """The domain accepts every address, so acceptance proves nothing.
+    Sendable under a sub-cap, with bounces weighted double."""
+    DISPOSABLE = "disposable"
+    ROLE_BASED = "role_based"
+    """info@/sales@/support@. Never sendable: bounce risk, and a shared inbox
+    where cold email is deleted unread."""
 
 
 class LeadSource(StrEnum):
@@ -379,6 +393,9 @@ class Message(BaseModel):
     send_state: SendState | None
     send_started_at: datetime | None
     send_block_reason: str | None
+    recipient_email_status: EmailStatus | None
+    """The recipient's status at reservation time — what a later bounce is
+    attributed to when weighting health metrics (M1.4a)."""
     sent_at: datetime | None
     created_at: datetime
     updated_at: datetime

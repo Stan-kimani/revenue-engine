@@ -27,7 +27,6 @@ from revenue_engine.agents import leadgen
 from revenue_engine.core import events as core_events
 from revenue_engine.db import repositories as repo
 from revenue_engine.db.models import Event, JobStatus, LeadSource, LeadStatus
-from revenue_engine.integrations.prospecting import ManualCsvProvider
 from revenue_engine.orchestrator import router
 
 pytestmark = pytest.mark.integration
@@ -470,11 +469,8 @@ async def test_lead_with_no_company_emits_enrichment_failed_reason_no_domain(
     assert json.loads(failed_event["payload"])["reason"] == "no_domain"
 
 
-# Sanity: ManualCsvProvider() with no csv_path is a valid, usable provider
-# for verify_email() alone (the shape agents/leadgen.py actually uses it in).
-async def test_manual_csv_provider_with_no_path_still_verifies_email():
-    provider = ManualCsvProvider()
-    from revenue_engine.db.models import EmailStatus
-
-    assert await provider.verify_email("valid@example.com") == EmailStatus.UNVERIFIED
-    assert await provider.verify_email("not-an-email") == EmailStatus.INVALID
+# ManualCsvProvider.verify_email() was removed at M1.4a: verification moved to
+# integrations/email_verification.py, called once at import. The test that
+# lived here asserted the old provider-level behaviour; its replacement is
+# tests/unit/test_email_verification.py plus the import-time tests in
+# tests/integration/test_email_verification.py.

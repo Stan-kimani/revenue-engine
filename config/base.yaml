@@ -101,10 +101,32 @@ deliverability:
     SG: Asia/Singapore
     KE: Africa/Nairobi
     ZA: Africa/Johannesburg
-  # contacts.email_status values the send gate accepts. Fail closed: with
-  # [valid] and no verification vendor yet, nothing sends to a real prospect.
-  # Do not add `unverified` to work around that — bounces trigger the §6 pause.
-  allowed_email_statuses: [valid]
+  # Three tiers (docs/deliverability.md §5). EVERY EmailStatus must appear in
+  # exactly one tier or the config loader refuses to boot — a status added
+  # later can never default to sendable by omission.
+  #   send:       verified mailbox, send normally
+  #   restricted: sendable, but capped by catch_all_share and its bounces
+  #               count double toward the §6 health thresholds
+  #   never:      not sendable, for any reason, ever
+  # role_based is never-send on two grounds, not one: bounce risk AND a shared
+  # inbox where cold email is deleted unread.
+  email_status_tiers:
+    send: [valid]
+    restricted: [catch_all]
+    never: [unverified, risky, invalid, bounced, suppressed, disposable, role_based]
+  # Fraction of daily_cap available to catch-all recipients (floored, minimum
+  # 1). A share, not an absolute: daily_cap climbs 5 -> 40 across warmup and a
+  # hardcoded 2 would quietly become absurd at 40/day. No hourly sub-cap —
+  # hourly_cap and min_gap_seconds already bind.
+  catch_all_share: 0.4
+  # A bounce from a catch-all domain is worth two: acceptance there never
+  # proved the mailbox existed, so a bounce is the first real evidence.
+  bounce_weight_by_status:
+    catch_all: 2.0
+  # Detected in code as well as by the verifier — these are recognisable
+  # without spending a credit, and the tier is never-send either way.
+  role_based_local_parts:
+    [info, sales, admin, support, hello, contact, billing, office, team, accounts, enquiries]
   # §7 message-level requirements, appended to every draft BEFORE approval so
   # the approver sees exactly what sends, and re-checked at send time.
   max_links: 1

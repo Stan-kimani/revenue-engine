@@ -253,12 +253,13 @@ async def _draft_precondition_failure(
             "prospect profile has no personalization anchors; a generic email with no "
             "specific reason to contact them is not drafted (phase1-llm-boundary.md §3)",
         )
-    if email_status not in cfg.allowed_email_statuses:
+    if cfg.email_status_tiers.tier_of(email_status) == "never":
         return (
             "email_status_not_allowed",
-            f"contacts.email_status is {email_status.value}; allowed: "
-            f"{sorted(s.value for s in cfg.allowed_email_statuses)}",
+            f"contacts.email_status is {email_status.value}, in the never-send tier",
         )
+    if sending.is_role_based_address(to_address, cfg):
+        return ("email_status_not_allowed", f"{to_address} is a role-based address")
     suppressions = await repo.find_active_suppressions(
         conn,
         address=to_address,

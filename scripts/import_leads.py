@@ -24,8 +24,17 @@ in the common single-process case:
      (DuplicateActiveLeadError, or a re-read deferred row) instead of a
      duplicate — handled below, not left to crash the row.
 
+Email verification (M1.4a): every contact is verified ONCE, here, and the
+verdict is stored permanently (contacts.email_status is write-once —
+repositories.upsert_contact preserves it). A contact that already carries a
+real verdict is skipped, so re-importing the same CSV spends no credits. With
+EMAILLISTVERIFY_API_KEY unset, or the API down, contacts stay `unverified`,
+which is the never-send tier — an import never produces a sendable address by
+failing.
+
 Usage: uv run python scripts/import_leads.py path/to/leads.csv
-Env: DATABASE_URL (required).
+Env: DATABASE_URL (required), EMAILLISTVERIFY_API_KEY (optional; without it
+     every contact stays unverified and therefore unsendable).
 """
 
 from __future__ import annotations
@@ -46,7 +55,11 @@ from revenue_engine.core import events as core_events
 from revenue_engine.core.config import get_config
 from revenue_engine.core.errors import DuplicateActiveLeadError
 from revenue_engine.db import repositories as repo
-from revenue_engine.db.models import Lead, LeadSource, LeadStatus
+from revenue_engine.db.models import Contact, EmailStatus, Lead, LeadSource, LeadStatus
+from revenue_engine.integrations.email_verification import (
+    EmailVerificationProvider,
+    default_provider,
+)
 from revenue_engine.integrations.prospecting import (
     CompanyStub,
     ContactStub,
@@ -63,12 +76,47 @@ class RowResult:
     detail: str | None = None
 
 
+async def _verify_contact(
+    conn: asyncpg.Connection,
+    contact: Contact,
+    *,
+    verifier: EmailVerificationProvider | None,
+) -> Contact:
+    """Verify once, never again. A contact carrying any verdict other than
+    `unverified` is returned untouched — credits are per address and a real
+    verdict does not go stale fast enough to justify paying twice."""
+    if verifier is None or contact.email_status != EmailStatus.UNVERIFIED:
+        return contact
+    result = await verifier.verify(contact.email)
+    if result.status == EmailStatus.UNVERIFIED:
+        # API down, out of credits, or an unrecognised answer: leave it
+        # unverified (never-send) rather than guessing.
+        return contact
+    observed_at = datetime.now(UTC).isoformat()
+    attributes = {
+        name: {
+            "value": value,
+            "confidence": 1.0,
+            "evidence": f"emaillistverify status={result.raw_status}",
+            "source": "provider:emaillistverify",
+            "run_id": None,
+            "observed_at": observed_at,
+        }
+        for name, value in result.attributes.items()
+    }
+    updated = await repo.set_email_status(
+        conn, email=contact.email, status=result.status, attributes=attributes
+    )
+    return updated or contact
+
+
 async def _import_row(
     conn: asyncpg.Connection,
     *,
     company_stub: CompanyStub,
     contact_stub: ContactStub,
     industry_pack: str,
+    verifier: EmailVerificationProvider | None,
 ) -> RowResult:
     company = await repo.upsert_company(conn, name=company_stub.name, domain=company_stub.domain)
 
@@ -100,6 +148,8 @@ async def _import_row(
         company_id=company.id,
         attributes=contact_attributes,
     )
+
+    contact = await _verify_contact(conn, contact, verifier=verifier)
 
     existing = await repo.get_active_or_deferred_lead_by_contact(conn, contact.id)
     if existing is not None:
@@ -254,6 +304,14 @@ async def run(csv_path: Path, *, industry_pack: str | None) -> int:
     for error in provider.errors:
         print(f"  row {error.row_number} rejected: {error.reason}", file=sys.stderr)
 
+    verifier = default_provider()
+    if verifier is None:
+        print(
+            "EMAILLISTVERIFY_API_KEY is not set: contacts will stay 'unverified' "
+            "and nothing will be sendable to them.",
+            file=sys.stderr,
+        )
+
     conn = await asyncpg.connect(database_url)
     results: list[RowResult] = []
     try:
@@ -285,6 +343,7 @@ async def run(csv_path: Path, *, industry_pack: str | None) -> int:
                     company_stub=company_stub,
                     contact_stub=contact_stub,
                     industry_pack=resolved_pack,
+                    verifier=verifier,
                 )
                 results.append(result)
     finally:

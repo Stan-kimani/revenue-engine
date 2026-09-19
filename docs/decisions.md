@@ -2208,3 +2208,105 @@ they depend on the gate rather than passing vacuously.
 and nothing processes replies yet — CAN-SPAM requires honouring opt-outs within 10 business days;
 (5) the §10 pre-flight checklist. A domain-wide suppression of a free-mail domain (e.g.
 `gmail.com`) would block every user of it — a write-side policy for M1.4b's unsubscribe handling.
+
+## 2026-09-19 — M1.4a addendum: three email status tiers + the verification adapter
+
+**Context:** `allowed_email_statuses: [valid]` refused catch-all domains outright, and B2B
+firms at our ICP size frequently run catch-all — the flat list would have refused most
+legitimate prospects. Catch-all nonetheless carries real bounce risk. Three tiers replace
+the two-state allow-list, and the verifier that makes any of it reachable ships in the same
+milestone: tiers with no verifier are inert, a verifier with no tiers has nothing to
+interpret its answers, and building them apart means two milestones that each send nothing.
+
+**Tiers (config/base.yaml, `deliverability.email_status_tiers`).** send: `valid`.
+restricted: `catch_all` — sendable, sub-capped, bounces weighted double. never:
+`unverified`, `risky`, `invalid`, `bounced`, `suppressed`, `disposable`, `role_based`.
+`unverified` and `risky` sit in never-send because the first is "no verdict yet" and the
+second is the verifier declining to confirm a mailbox — the same exposure as `invalid`
+without the certainty. Boot validation asserts every `EmailStatus` member appears in
+exactly one tier, so a status added later fails the boot rather than defaulting to
+sendable by omission (the same posture as M1.2's disqualifier-evaluability check).
+entity-model.md §3.2's enum row and deliverability.md §5/§6 were updated to match.
+
+**`role_based` is never-send on two grounds, not one.** Those addresses carry bounce risk
+AND they land in shared inboxes where cold email is deleted unread — the classification is
+right for deliverability and for conversion independently. They are caught twice over: by
+the verifier's `role` flag, and by a local-part check
+(`deliverability.role_based_local_parts`) that spends no credit and works before any
+verifier exists.
+
+**The sub-cap is a share, not an absolute.** `catch_all_share: 0.4`, floored, minimum 1 —
+2 of today's `daily_cap: 5`. `daily_cap` climbs 5 → 40 across the warmup ramp, and a
+hardcoded 2 would quietly become absurdly restrictive at 40/day while nobody remembers it
+exists. One number to update instead of two. No hourly sub-cap: `hourly_cap` and
+`min_gap_seconds` already bind.
+
+**Double-weighted catch-all bounces, accepted with their consequence.** Acceptance from a
+catch-all domain never proved the mailbox existed, so a bounce there is the first real
+evidence. Weighted by `messages.recipient_email_status` — the status snapshotted at
+RESERVATION, not the contact's status now, which a bounce will since have changed to
+`bounced`. Without that snapshot the weighting is unenforceable. Combined with the §6
+sample floor (2 hard bounces pause below 50 sends), **one catch-all bounce in the first
+fifty sends pauses sending outright.** Deliberate: a false pause costs a day and one
+`scripts/resume_sending.py` run; a missed signal costs months of domain reputation.
+`score` and `free` are stored as ordinary contact attributes and tiered on by nothing —
+score is a vendor confidence number, and a founder at a 40-person agency legitimately using
+a gmail.com address is squarely in the ICP.
+
+**BLOCKING CONFLICT FOUND BEFORE IMPLEMENTING: `email_status` was being clobbered.**
+`upsert_contact` overwrote `email_status` unconditionally on conflict (`= EXCLUDED`, unlike
+every other column's COALESCE), and two callers passed the `UNVERIFIED` default:
+`agents/leadgen.py` verified on every enrichment through `ManualCsvProvider.verify_email`
+(syntax-only, never returns VALID), and `scripts/import_leads.py` re-imported without a
+status. Enrichment runs *after* import, so the real sequence would have been: import spends
+a credit and writes `valid` → enrichment immediately overwrites it with `unverified` → the
+send gate refuses everything. It would have looked like a broken verifier rather than a
+clobbered write, and the credits would have been spent either way. Resolved three ways:
+(1) `upsert_contact` now preserves the stored status — the column is NOT NULL so this is a
+plain assignment, not a COALESCE wrapper, which would have been a no-op dressed as a guard;
+(2) `set_email_status()` is the only path that changes it, and refuses to set `unverified`,
+so a verdict or a later bounce can never be undone by a re-import; (3) enrichment no longer
+verifies at all — `lead.enriched` reports the stored verdict.
+
+**`verify_email` removed from `ProspectingProvider`** (discovery-addendum.md §3/§4 updated).
+Two interfaces both claiming to verify an address is precisely what produced the conflict
+above; leaving it as dead code would have kept the trap for whoever builds the discovery
+flow. `tests/integration/test_leadgen.py::test_manual_csv_provider_with_no_path_still_verifies_email`
+tested the removed behaviour and was deleted, not weakened — its replacement is the new
+verification test modules.
+
+**Verification runs once, at import.** `integrations/email_verification.py` is an interface
+plus one adapter (`EmailListVerifyProvider`), the same shape as `prospecting.py`. A contact
+carrying any real verdict is skipped, so re-importing a CSV spends nothing; only
+`unverified` contacts are looked up, which also means the contacts already in the database
+get verified on their next import rather than being stranded — no backfill script needed.
+
+**The JSON endpoint, flags before status.** EmailListVerify exposes `role`, `disposable`
+and `accept_all` as booleans *orthogonal to* `status`: an address can be status `valid` AND
+role true. A single-column lookup would have tiered that as `valid` and sent cold outreach
+to `info@`. So flags are evaluated first (role → disposable → accept_all), then status
+(`valid`→valid, `invalid`→invalid, `unknown`→risky). **Any unrecognised status word maps to
+`unverified`** — never-send, and still eligible for a later lookup once the map is
+corrected. `LEGACY_STATUS_MAP` records the older string endpoint's vocabulary so a future
+fallback cannot silently mis-tier: `ok_for_all` is a SECOND catch-all spelling alongside
+`accept_all`, and `email_disabled`/`dead_server`/`invalid_mx` all mean invalid.
+
+**Every verification failure yields `unverified`, never `valid`** — API down, 402 out of
+credits, timeout, or a malformed body. `EMAILLISTVERIFY_API_KEY` unset means
+`default_provider()` returns None: imports still work and every contact stays unverified,
+i.e. unsendable.
+
+**Tests.** A second autouse guard in `tests/conftest.py` makes the real provider's
+`verify()` raise — patched on the class, not on `default_provider`, because
+`scripts/import_leads.py` binds that name into its own namespace at import and patching it
+there would leave the real network path reachable from the one place it is actually called.
+Mutation-checked, as for the send gate: forcing every status into the send tier fails the
+sub-cap and never-send tests, and flattening the bounce weights fails the double-weight
+test while leaving the valid-tier control passing — so both are load-bearing rather than
+vacuously green.
+
+**Consequence.** With a real `EMAILLISTVERIFY_API_KEY` and a re-import, addresses can now
+reach the send tier for the first time — the send path stops being inert. The remaining
+pre-send blockers are unchanged: personalization anchors at import (nothing drafts without
+them), `physical_address` in config, and M1.4b for reply handling before any real prospect
+is emailed.

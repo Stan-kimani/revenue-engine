@@ -66,7 +66,8 @@ ACTOR = "core.sending"
 SEND_JOB_TYPE = "sales.send_outreach"
 
 # entity-model.md D6: these contact statuses are never sendable, whatever
-# allowed_email_statuses says. A rule, not a tunable.
+# email_status_tiers says. A rule, not a tunable — a config edit that put
+# 'bounced' in the send tier must still not send to it.
 _NEVER_SENDABLE_STATUSES = frozenset(
     {EmailStatus.SUPPRESSED, EmailStatus.BOUNCED, EmailStatus.INVALID}
 )
@@ -196,6 +197,12 @@ def address_domain(address: str) -> str:
     return address.rsplit("@", 1)[-1].strip().lower()
 
 
+def is_role_based_address(address: str, cfg: DeliverabilityConfig) -> bool:
+    """info@, sales@, support@ ... — recognisable without a verifier call."""
+    local_part = address.rsplit("@", 1)[0].strip().lower()
+    return local_part in cfg.role_based_local_parts
+
+
 def compose_outbound_body(draft_body: str, cfg: DeliverabilityConfig) -> str:
     """Appends §7's opt-out sentence and physical address to the model's
     body at draft time, so the approver sees exactly what sends. An empty
@@ -278,15 +285,15 @@ class HealthEvaluation:
 def evaluate_health(
     *,
     sends: int,
-    hard_bounces: int,
-    spam_complaints: int,
-    unsubscribes: int,
+    hard_bounces: float,
+    spam_complaints: float,
+    unsubscribes: float,
     health: HealthConfig,
 ) -> HealthEvaluation:
     """§6 with the M1.4a sample floor: below `sample_floor_sends`, rates do
     not evaluate and absolute counts pause instead; at or above it, the rates
     apply as written. Zero sends is a floor case, never a division by zero."""
-    counts = {
+    counts: dict[str, float] = {
         "hard_bounce": hard_bounces,
         "spam_complaint": spam_complaints,
         "unsubscribe": unsubscribes,
@@ -305,13 +312,13 @@ def evaluate_health(
         for reason, limit in sorted(health.below_floor_pause_counts.items()):
             if counts[reason] >= limit:
                 pause.append(
-                    f"{reason} count {counts[reason]} >= {limit} "
+                    f"{reason} count {counts[reason]:g} >= {limit} "
                     f"(below the {health.sample_floor_sends}-send sample floor)"
                 )
         return HealthEvaluation(tuple(pause), tuple(warnings), metrics)
 
     metrics["mode"] = "rates"
-    rate_sources = {
+    rate_sources: dict[str, float] = {
         "bounce": hard_bounces,
         "spam_complaint": spam_complaints,
         "unsubscribe": unsubscribes,
@@ -592,15 +599,25 @@ async def _evaluate(
             "contacts.email_status is suppressed",
             Disposition.BLOCKED,
         )
-    if (
-        contact.email_status in _NEVER_SENDABLE_STATUSES
-        or contact.email_status not in cfg.allowed_email_statuses
-    ):
+    tier = cfg.email_status_tiers.tier_of(contact.email_status)
+    if contact.email_status in _NEVER_SENDABLE_STATUSES or tier == "never":
         return SendDecision.refuse(
             SendGate.SUPPRESSION,
             "email_status_not_allowed",
-            f"contacts.email_status is {contact.email_status.value}; allowed: "
-            f"{sorted(s.value for s in cfg.allowed_email_statuses)}",
+            f"contacts.email_status is {contact.email_status.value} (tier: {tier}); "
+            f"sendable tiers: send={sorted(x.value for x in cfg.email_status_tiers.send)}, "
+            f"restricted={sorted(x.value for x in cfg.email_status_tiers.restricted)}",
+            Disposition.BLOCKED,
+        )
+    if is_role_based_address(recipient, cfg):
+        # Detected in code as well as by the verifier: a role address is
+        # recognisable without spending a credit, and it fails on two grounds —
+        # bounce risk, and a shared inbox where cold email is deleted unread.
+        return SendDecision.refuse(
+            SendGate.SUPPRESSION,
+            "email_status_not_allowed",
+            f"{recipient} is a role-based address (local part in "
+            "deliverability.role_based_local_parts)",
             Disposition.BLOCKED,
         )
 
@@ -616,6 +633,25 @@ async def _evaluate(
             Disposition.DEFERRED,
             retry_after=now + timedelta(hours=1),
         )
+    if tier == "restricted":
+        # Catch-all is permitted under stricter accounting, not treated as
+        # equivalent to a verified mailbox (docs/deliverability.md §5).
+        restricted_sends = await repo.count_sends_since(
+            conn,
+            sending_domain=cfg.sending_domain,
+            since=now - timedelta(hours=24),
+            recipient_email_status=contact.email_status,
+        )
+        if restricted_sends >= cfg.catch_all_daily_cap:
+            return SendDecision.refuse(
+                SendGate.CAP,
+                "catch_all_cap_reached",
+                f"{restricted_sends} sends to {contact.email_status.value} recipients in the "
+                f"last 24h >= catch_all sub-cap {cfg.catch_all_daily_cap} "
+                f"({cfg.catch_all_share:g} of daily_cap {cfg.daily_cap})",
+                Disposition.DEFERRED,
+                retry_after=now + timedelta(hours=1),
+            )
     hourly = await repo.count_sends_since(
         conn, sending_domain=cfg.sending_domain, since=now - timedelta(hours=1)
     )
@@ -686,11 +722,19 @@ async def _measure_health(
     since = now - timedelta(days=cfg.health.window_days)
     return evaluate_health(
         sends=await repo.count_sends_since(conn, sending_domain=cfg.sending_domain, since=since),
-        hard_bounces=await repo.count_suppressions_since(
-            conn, reason=SuppressionReason.HARD_BOUNCE, since=since
+        # Weighted by the recipient's status at send time: a catch-all bounce
+        # counts double (docs/deliverability.md §6).
+        hard_bounces=await repo.count_weighted_suppressions_since(
+            conn,
+            reason=SuppressionReason.HARD_BOUNCE,
+            since=since,
+            weight_by_status=cfg.bounce_weight_by_status,
         ),
-        spam_complaints=await repo.count_suppressions_since(
-            conn, reason=SuppressionReason.SPAM_COMPLAINT, since=since
+        spam_complaints=await repo.count_weighted_suppressions_since(
+            conn,
+            reason=SuppressionReason.SPAM_COMPLAINT,
+            since=since,
+            weight_by_status=cfg.bounce_weight_by_status,
         ),
         unsubscribes=await repo.count_suppressions_since(
             conn, reason=SuppressionReason.UNSUBSCRIBE, since=since
@@ -731,7 +775,18 @@ async def authorize_send(
                 environ=environ,
             )
             if decision.allowed:
-                reserved = await repo.reserve_message_for_send(conn, message_id, now=now)
+                # Snapshot the recipient's status onto the reservation: a
+                # later bounce is attributed to the tier we sent under, not to
+                # whatever the contact's status has become by then.
+                recipient = await repo.get_contact_by_email(conn, to_address.lower())
+                reserved = await repo.reserve_message_for_send(
+                    conn,
+                    message_id,
+                    now=now,
+                    recipient_email_status=(
+                        recipient.email_status if recipient else EmailStatus.UNVERIFIED
+                    ),
+                )
                 if reserved is not None:
                     return decision, SendAuthorization(
                         message=reserved,

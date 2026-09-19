@@ -52,7 +52,8 @@ call. A bug that loops discovery must cost a bounded amount of money.
 
 ## 3. New interface: `integrations/prospecting.py`
 
-Three operations, one interface, because a single vendor typically provides all three.
+Two operations, one interface. Verification was a third until M1.4a, when it
+moved to its own provider (see the note in the Protocol below).
 Separate from `integrations/enrichment.py` only if a second vendor is ever used for one.
 
 ```python
@@ -65,7 +66,11 @@ class ProspectingProvider(Protocol):
         self, company: CompanyStub, target_titles: list[str], limit: int
     ) -> list[ContactStub]: ...
 
-    async def verify_email(self, email: str) -> EmailStatus: ...
+    # verify_email was REMOVED from this interface at M1.4a. Verification
+    # lives in integrations/email_verification.py and runs once, at import;
+    # discovery calls that provider directly when it is built. Two interfaces
+    # both claiming to verify an address is what let enrichment silently
+    # clobber a paid verdict back to `unverified` (docs/decisions.md).
 ```
 
 `DiscoveryFilters` is built **from the industry pack**, never hand-written per run:
@@ -90,7 +95,7 @@ discovery.requested
       drop domains with an active lead (single-thread rule)
       drop suppressed / previously disqualified
   → provider.find_contacts(remaining, target_titles)
-  → provider.verify_email() on each
+  → email_verification provider .verify() on each (NOT the prospecting provider)
   → drop unverified/invalid — never create a lead with an unverified address
   → create company + contact + lead rows
   → emit lead.captured per survivor  → normal Phase 1 pipeline

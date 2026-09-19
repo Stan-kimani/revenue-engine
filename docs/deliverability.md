@@ -184,7 +184,46 @@ A sequence at step 3 across 30 leads is 30 sends against the cap.
 
 ---
 
-## 5. Suppression
+## 5. Address status tiers and suppression
+
+### Verification and the three tiers
+
+Every address is verified ONCE, at import (`integrations/email_verification.py`,
+EmailListVerify), and the verdict is stored permanently on the contact. Credits
+are charged per address and a mailbox's status does not go stale fast enough to
+justify paying twice, so an address carrying any real verdict is never
+re-verified — only an `unverified` contact is looked up. A verification that
+fails (API down, out of credits, an unrecognised answer) leaves the contact
+`unverified`, which is never-send: a failure can never produce a sendable
+address.
+
+The provider reports `role`, `disposable` and `accept_all` as booleans
+*independent of* `status`. An address can be status `valid` AND role true, so
+flags are evaluated first; tiering on status alone would send cold outreach to
+`info@`.
+
+| Tier | Statuses | Treatment |
+|---|---|---|
+| send | `valid` | Sends normally. |
+| restricted | `catch_all` | Sendable, but capped at `catch_all_share` of `daily_cap` (0.4 → 2 of 5 today), and its bounces count double toward §6. |
+| never | `unverified`, `risky`, `invalid`, `bounced`, `suppressed`, `disposable`, `role_based` | Never sent to, for any reason. |
+
+Catch-all exists as its own tier because B2B domains at our ICP size frequently
+run catch-all: refusing them outright would refuse most legitimate prospects.
+But a catch-all domain accepts *everything*, so acceptance proves nothing about
+the mailbox — permitted under stricter accounting, not treated as verified.
+
+**`role_based` is never-send on two grounds, not one:** those addresses carry
+bounce risk, *and* they land in shared inboxes where cold email is deleted
+unread. The classification is correct for deliverability and for conversion.
+Role addresses are caught twice over: by the verifier's `role` flag, and by a
+local-part check (`role_based_local_parts`) that needs no credit.
+
+Every `EmailStatus` must appear in exactly one tier or the config loader
+refuses to boot — a status added later can never default to sendable by
+omission.
+
+### Suppression
 
 Checked *before* every send, without exception. This is the most important
 safety mechanism in the send path — a message to a suppressed address is worse
@@ -242,6 +281,15 @@ The sample floor, the absolute counts and the rates all live in `config/base.yam
 (`deliverability.health`). Bounce rate counts hard bounces only; soft bounces are
 temporary suppressions (§5). A warn threshold alerts Slack at most once per metric per
 day and does not pause.
+
+**A bounce from a catch-all recipient counts double** (`bounce_weight_by_status`).
+Acceptance from a catch-all domain never proved the mailbox existed, so the bounce is the
+first real evidence about that address. Each bounce is weighted by the status the
+recipient had *at the moment we reserved the send* (`messages.recipient_email_status`),
+not by whatever the contact's status has become since. Combined with the floor above,
+this means **one catch-all bounce inside the first fifty sends pauses sending on its
+own** — deliberate: a false pause costs a day and one `scripts/resume_sending.py` run,
+while a missed signal costs months of domain reputation.
 
 **Hard pause stops the send path entirely** and alerts Slack. It does not
 throttle, degrade, or continue at reduced volume. It stops, and a human decides

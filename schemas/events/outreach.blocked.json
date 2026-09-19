@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "outreach.blocked",
-  "description": "A send gate refused, a send failed or had an unknown outcome, or a draft was skipped before any LLM call (M1.4a). Every refusal is observable — a blocked send must never fail silently (event-catalog.md §3). The reason enum extends the catalog's original four values additively; `gate`, `detail`, `disposition` and `deferred_until` are additive fields. `draft_id` is null only when gate is draft_precondition (no draft was created).",
+  "description": "A send gate refused, a send failed or had an unknown outcome, or a draft was skipped before any LLM call (M1.4a). Every refusal is observable \u2014 a blocked send must never fail silently (event-catalog.md \u00a73). The reason enum extends the catalog's original four values additively; `gate`, `detail`, `disposition` and `deferred_until` are additive fields. `draft_id` is null only when gate is draft_precondition (no draft was created).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -36,6 +36,7 @@
         "suppressed_domain",
         "email_status_not_allowed",
         "daily_cap_reached",
+        "catch_all_cap_reached",
         "hourly_cap_reached",
         "min_gap_not_elapsed",
         "outside_send_window",

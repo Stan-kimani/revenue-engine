@@ -473,7 +473,11 @@ def test_real_deliverability_block_matches_the_warmup_week_and_the_icp_clock():
     assert d.daily_cap == 5
     assert d.sending_domain == "getkimani.com"
     assert d.default_recipient_timezone == "America/New_York"
-    assert {s.value for s in d.allowed_email_statuses} == {"valid"}
+    assert {s.value for s in d.email_status_tiers.send} == {"valid"}
+    assert {s.value for s in d.email_status_tiers.restricted} == {"catch_all"}
+    assert d.catch_all_share == 0.4
+    assert d.catch_all_daily_cap == 2  # 0.4 of daily_cap 5, floored
+    assert d.bounce_weight_by_status["catch_all"] == 2.0
     assert d.health.sample_floor_sends == 50
     assert dict(d.health.below_floor_pause_counts) == {"hard_bounce": 2, "spam_complaint": 1}
 
@@ -505,4 +509,48 @@ def test_refuses_to_boot_when_warn_exceeds_pause(tmp_path: Path):
     base = _real_base_data()
     base["deliverability"]["health"]["rates"]["bounce"] = {"warn": 0.05, "pause": 0.03}
     with pytest.raises(ConfigError, match="warn <= pause"):
+        _load_with_base(tmp_path, base)
+
+
+# ---------------------------------------------------------------------------
+# M1.4a — email status tiers (docs/deliverability.md §5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_when_an_email_status_is_in_no_tier(tmp_path: Path):
+    """A status nobody classified must never default to sendable by omission."""
+    base = _real_base_data()
+    never = base["deliverability"]["email_status_tiers"]["never"]
+    never.remove("disposable")
+    with pytest.raises(ConfigError, match="exactly one email_status_tiers tier"):
+        _load_with_base(tmp_path, base)
+
+
+@pytest.mark.protected
+def test_refuses_to_boot_when_an_email_status_is_in_two_tiers(tmp_path: Path):
+    base = _real_base_data()
+    base["deliverability"]["email_status_tiers"]["send"].append("catch_all")
+    with pytest.raises(ConfigError, match="exactly one email_status_tiers tier"):
+        _load_with_base(tmp_path, base)
+
+
+def test_refuses_to_boot_on_a_missing_tier_name(tmp_path: Path):
+    base = _real_base_data()
+    del base["deliverability"]["email_status_tiers"]["restricted"]
+    with pytest.raises(ConfigError, match="email_status_tiers"):
+        _load_with_base(tmp_path, base)
+
+
+def test_refuses_to_boot_on_an_out_of_range_catch_all_share(tmp_path: Path):
+    base = _real_base_data()
+    base["deliverability"]["catch_all_share"] = 1.5
+    with pytest.raises(ConfigError, match="catch_all_share"):
+        _load_with_base(tmp_path, base)
+
+
+def test_refuses_to_boot_when_a_bounce_weight_names_an_unknown_status(tmp_path: Path):
+    base = _real_base_data()
+    base["deliverability"]["bounce_weight_by_status"]["not_a_status"] = 3
+    with pytest.raises(ConfigError, match="unknown statuses"):
         _load_with_base(tmp_path, base)

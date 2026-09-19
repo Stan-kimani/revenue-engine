@@ -117,15 +117,19 @@ async def _seed(
     email_status: EmailStatus = EmailStatus.VALID,
     country: str | None = "US",
     sequence_step: int = 0,
+    local_part: str = "pat",
 ) -> Seeded:
     """A drafted message bound to an approval, built the way
     agents/sales.py::handle_draft_outreach builds one (minus the LLM calls)."""
     tag = uuid.uuid4().hex[:8]
     domain = f"acme-{tag}.example"
     company = await repo.upsert_company(conn, name="Acme", domain=domain, country=country)
-    contact = await repo.upsert_contact(
-        conn, email=f"pat@{domain}", email_status=email_status, company_id=company.id
-    )
+    contact = await repo.upsert_contact(conn, email=f"{local_part}@{domain}", company_id=company.id)
+    if email_status != EmailStatus.UNVERIFIED:
+        # email_status is write-once from verification (M1.4a): upsert_contact
+        # preserves it, so a seeded verdict is set through the one path that
+        # may change it.
+        await repo.set_email_status(conn, email=contact.email, status=email_status)
     created = await repo.create_lead(
         conn,
         contact_id=contact.id,
@@ -221,20 +225,30 @@ async def _blocked_events(conn: asyncpg.Connection, message_id: uuid.UUID) -> li
 
 
 async def _insert_sent(
-    conn: asyncpg.Connection, cfg: DeliverabilityConfig, *, started_at: datetime, step: int = 0
-) -> None:
+    conn: asyncpg.Connection,
+    cfg: DeliverabilityConfig,
+    *,
+    started_at: datetime,
+    step: int = 0,
+    recipient_email_status: EmailStatus = EmailStatus.VALID,
+    to_address: str | None = None,
+) -> str:
+    recipient = to_address or f"someone-{uuid.uuid4().hex[:6]}@elsewhere.example"
     await conn.execute(
         """
         INSERT INTO messages (direction, channel, from_address, to_address, send_state,
-                              send_started_at, sent_at, provider_message_id, sequence_step)
-        VALUES ('outbound', 'email', $1, $2, 'sent', $3, $3, $4, $5)
+                              send_started_at, sent_at, provider_message_id, sequence_step,
+                              recipient_email_status)
+        VALUES ('outbound', 'email', $1, $2, 'sent', $3, $3, $4, $5, $6)
         """,
         cfg.from_address,
-        f"someone-{uuid.uuid4().hex[:6]}@elsewhere.example",
+        recipient,
         started_at,
         f"prior-{uuid.uuid4().hex}",
         step,
+        recipient_email_status.value,
     )
+    return recipient
 
 
 # ===========================================================================
@@ -464,7 +478,7 @@ async def test_health_threshold_breach_pauses_sending_entirely(conn: asyncpg.Con
 
 
 async def test_a_refusal_records_which_gate_fired_and_why(conn: asyncpg.Connection):
-    cfg = _cfg(allowed_email_statuses=frozenset({EmailStatus.VALID}))
+    cfg = _cfg()  # unverified is in the never-send tier
     transport = StubTransport()
     seeded = await _seed(conn, cfg=cfg, email_status=EmailStatus.UNVERIFIED)
 
@@ -662,3 +676,147 @@ async def test_a_sent_message_can_never_return_to_drafted(conn: asyncpg.Connecti
         await conn.execute(
             "UPDATE messages SET send_state = 'drafted' WHERE id = $1", seeded.message_id
         )
+
+
+# ===========================================================================
+# M1.4a tiers — catch-all under stricter accounting, never-send refused
+# ===========================================================================
+
+
+@pytest.mark.protected
+async def test_catch_all_sub_cap_refuses_once_the_share_is_used(conn: asyncpg.Connection):
+    """Catch-all is sendable, but capped at catch_all_share of daily_cap —
+    2 of 5 today. The main daily cap is nowhere near reached."""
+    cfg = _cfg(daily_cap=5, catch_all_share=0.4)
+    assert cfg.catch_all_daily_cap == 2
+    transport = StubTransport()
+    for _ in range(2):
+        await _insert_sent(
+            conn,
+            cfg,
+            started_at=NOW - timedelta(hours=6),
+            recipient_email_status=EmailStatus.CATCH_ALL,
+        )
+    seeded = await _seed(conn, cfg=cfg, email_status=EmailStatus.CATCH_ALL)
+
+    await _attempt(conn, seeded, cfg=cfg, transport=transport)
+
+    assert transport.sent == []
+    events = await _blocked_events(conn, seeded.message_id)
+    assert (events[0]["gate"], events[0]["reason"]) == ("cap", "catch_all_cap_reached")
+    assert events[0]["disposition"] == "deferred"  # held for later, not dropped
+    message = await repo.get_message(conn, seeded.message_id)
+    assert message is not None and message.send_state == SendState.DRAFTED
+
+
+@pytest.mark.protected
+@pytest.mark.parametrize(
+    "status",
+    [EmailStatus.ROLE_BASED, EmailStatus.DISPOSABLE, EmailStatus.RISKY, EmailStatus.UNVERIFIED],
+)
+async def test_never_send_tier_statuses_are_refused(conn: asyncpg.Connection, status: EmailStatus):
+    cfg = _cfg()
+    transport = StubTransport()
+    seeded = await _seed(conn, cfg=cfg, email_status=status)
+
+    await _attempt(conn, seeded, cfg=cfg, transport=transport)
+
+    assert transport.sent == []
+    events = await _blocked_events(conn, seeded.message_id)
+    assert events[0]["reason"] == "email_status_not_allowed"
+    assert status.value in events[0]["detail"]
+    message = await repo.get_message(conn, seeded.message_id)
+    assert message is not None and message.send_state == SendState.BLOCKED
+
+
+@pytest.mark.protected
+async def test_a_role_based_address_is_refused_even_when_verified_valid(
+    conn: asyncpg.Connection,
+):
+    """The verifier's own flags are not the only guard: a role local part is
+    refused on the address alone. Role addresses fail on two grounds — bounce
+    risk, and a shared inbox where cold email is deleted unread."""
+    cfg = _cfg()
+    transport = StubTransport()
+    seeded = await _seed(conn, cfg=cfg, email_status=EmailStatus.VALID, local_part="info")
+
+    await _attempt(conn, seeded, cfg=cfg, transport=transport)
+
+    assert transport.sent == []
+    events = await _blocked_events(conn, seeded.message_id)
+    assert events[0]["reason"] == "email_status_not_allowed"
+    assert "role-based" in events[0]["detail"]
+
+
+async def test_catch_all_sends_under_the_sub_cap_and_snapshots_the_status(
+    conn: asyncpg.Connection,
+):
+    cfg = _cfg()
+    transport = StubTransport()
+    seeded = await _seed(conn, cfg=cfg, email_status=EmailStatus.CATCH_ALL)
+
+    await _attempt(conn, seeded, cfg=cfg, transport=transport)
+
+    assert len(transport.sent) == 1
+    message = await repo.get_message(conn, seeded.message_id)
+    assert message is not None and message.send_state == SendState.SENT
+    # The snapshot is what a later bounce is attributed to.
+    assert message.recipient_email_status == EmailStatus.CATCH_ALL
+
+
+@pytest.mark.protected
+async def test_one_catch_all_bounce_weighs_double_and_pauses_sending(
+    conn: asyncpg.Connection,
+):
+    """Below the sample floor 2 hard bounces pause. A single bounce from an
+    address we sent to as catch-all is weighted 2 and pauses on its own —
+    acceptance from a catch-all domain never proved the mailbox existed."""
+    cfg = _cfg()
+    transport = StubTransport()
+    bounced = await _insert_sent(
+        conn,
+        cfg,
+        started_at=NOW - timedelta(hours=8),
+        recipient_email_status=EmailStatus.CATCH_ALL,
+    )
+    await repo.insert_suppression(
+        conn,
+        address=bounced,
+        domain=sending.address_domain(bounced),
+        reason=SuppressionReason.HARD_BOUNCE,
+        source="test",
+    )
+    seeded = await _seed(conn, cfg=cfg)
+
+    await _attempt(conn, seeded, cfg=cfg, transport=transport)
+
+    assert transport.sent == []
+    events = await _blocked_events(conn, seeded.message_id)
+    assert (events[0]["gate"], events[0]["reason"]) == ("health", "sending_paused")
+    pause = await repo.get_open_sending_pause(conn, sending_domain=cfg.sending_domain)
+    assert pause is not None
+    assert pause.metrics["hard_bounce"] == 2.0  # one bounce, weighted double
+
+
+async def test_a_valid_tier_bounce_alone_does_not_pause(conn: asyncpg.Connection):
+    """The same single bounce from a verified-valid recipient weighs 1, which
+    is below the 2-bounce floor threshold — so the weighting is what made the
+    catch-all case pause, not the bounce count."""
+    cfg = _cfg()
+    transport = StubTransport()
+    bounced = await _insert_sent(
+        conn, cfg, started_at=NOW - timedelta(hours=8), recipient_email_status=EmailStatus.VALID
+    )
+    await repo.insert_suppression(
+        conn,
+        address=bounced,
+        domain=sending.address_domain(bounced),
+        reason=SuppressionReason.HARD_BOUNCE,
+        source="test",
+    )
+    seeded = await _seed(conn, cfg=cfg)
+
+    await _attempt(conn, seeded, cfg=cfg, transport=transport)
+
+    assert len(transport.sent) == 1
+    assert await repo.get_open_sending_pause(conn, sending_domain=cfg.sending_domain) is None

@@ -127,6 +127,25 @@ class HealthConfig:
 
 
 @dataclass(frozen=True)
+class EmailStatusTiers:
+    """docs/deliverability.md §5. Every EmailStatus member belongs to exactly
+    one tier — asserted at boot, so a status added later fails the boot rather
+    than defaulting to sendable."""
+
+    send: frozenset[EmailStatus]
+    restricted: frozenset[EmailStatus]
+    """Sendable, but under a sub-cap and with bounces weighted double."""
+    never: frozenset[EmailStatus]
+
+    def tier_of(self, status: EmailStatus) -> str:
+        if status in self.send:
+            return "send"
+        if status in self.restricted:
+            return "restricted"
+        return "never"
+
+
+@dataclass(frozen=True)
 class DeliverabilityConfig:
     """docs/deliverability.md §4 and §7 — every number the send path uses."""
 
@@ -143,7 +162,13 @@ class DeliverabilityConfig:
     timezone_source: str
     default_recipient_timezone: str
     country_timezones: MappingProxyType[str, str]
-    allowed_email_statuses: frozenset[EmailStatus]
+    email_status_tiers: EmailStatusTiers
+    catch_all_share: float
+    """Fraction of `daily_cap` that may go to catch-all recipients. Expressed
+    as a share, not an absolute, so it tracks daily_cap across the warmup ramp
+    (5 -> 40) instead of silently becoming absurdly restrictive."""
+    bounce_weight_by_status: MappingProxyType[str, float]
+    role_based_local_parts: frozenset[str]
     max_links: int
     opt_out_sentence: str
     physical_address: str
@@ -152,6 +177,15 @@ class DeliverabilityConfig:
     authorization_ttl_seconds: int
     gmail_timeout_seconds: int
     health: HealthConfig
+
+    @property
+    def catch_all_daily_cap(self) -> int:
+        """`catch_all_share` of daily_cap, floored, minimum 1 — one restricted
+        send is always permitted while the cap is non-zero, so a small warmup
+        cap doesn't silently forbid the category outright."""
+        if self.daily_cap <= 0:
+            return 0
+        return max(1, int(self.daily_cap * self.catch_all_share))
 
 
 @dataclass(frozen=True)
@@ -426,9 +460,37 @@ def _parse_deliverability(raw_base: dict[str, Any], base_config_path: Path) -> D
             except (ZoneInfoNotFoundError, ValueError) as exc:
                 raise fail(f"unknown IANA timezone {tz_name!r}") from exc
 
-        allowed_statuses = frozenset(EmailStatus(s) for s in d["allowed_email_statuses"])
-        if not allowed_statuses:
-            raise fail("allowed_email_statuses must not be empty")
+        tiers_raw = d["email_status_tiers"]
+        if set(tiers_raw) != {"send", "restricted", "never"}:
+            raise fail(
+                "email_status_tiers must define exactly ['never', 'restricted', 'send'], "
+                f"found {sorted(tiers_raw)}"
+            )
+        tiers = {name: [EmailStatus(v) for v in values] for name, values in tiers_raw.items()}
+        classified = [status for values in tiers.values() for status in values]
+        duplicates = sorted({s.value for s in classified if classified.count(s) > 1})
+        unclassified = sorted(s.value for s in EmailStatus if s not in classified)
+        if duplicates or unclassified:
+            raise fail(
+                "every EmailStatus must appear in exactly one email_status_tiers tier — "
+                f"unclassified: {unclassified}, in more than one: {duplicates}"
+            )
+        email_status_tiers = EmailStatusTiers(
+            send=frozenset(tiers["send"]),
+            restricted=frozenset(tiers["restricted"]),
+            never=frozenset(tiers["never"]),
+        )
+
+        catch_all_share = float(d["catch_all_share"])
+        if not 0 <= catch_all_share <= 1:
+            raise fail(f"catch_all_share must be between 0 and 1, got {catch_all_share}")
+        bounce_weights = {str(k): float(v) for k, v in d["bounce_weight_by_status"].items()}
+        unknown_weighted = sorted(set(bounce_weights) - {s.value for s in EmailStatus})
+        if unknown_weighted:
+            raise fail(f"bounce_weight_by_status names unknown statuses: {unknown_weighted}")
+        if any(w < 0 for w in bounce_weights.values()):
+            raise fail("bounce_weight_by_status values must be >= 0")
+        role_local_parts = frozenset(str(p).strip().lower() for p in d["role_based_local_parts"])
 
         below_floor = {str(k): int(v) for k, v in health_raw["below_floor_pause_counts"].items()}
         if set(below_floor) - _VALID_BELOW_FLOOR_REASONS or not below_floor:
@@ -463,7 +525,10 @@ def _parse_deliverability(raw_base: dict[str, Any], base_config_path: Path) -> D
             timezone_source=timezone_source,
             default_recipient_timezone=default_tz,
             country_timezones=MappingProxyType(country_timezones),
-            allowed_email_statuses=allowed_statuses,
+            email_status_tiers=email_status_tiers,
+            catch_all_share=catch_all_share,
+            bounce_weight_by_status=MappingProxyType(bounce_weights),
+            role_based_local_parts=role_local_parts,
             max_links=ints["max_links"],
             opt_out_sentence=str(d["opt_out_sentence"]).strip(),
             physical_address=str(d["physical_address"] or "").strip(),

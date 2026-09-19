@@ -20,10 +20,11 @@ from revenue_engine.core.sending import (
     check_content,
     compose_outbound_body,
     evaluate_health,
+    is_role_based_address,
     next_window_open,
     resolve_recipient_timezone,
 )
-from revenue_engine.db.models import Message, SendState
+from revenue_engine.db.models import EmailStatus, Message, SendState
 from revenue_engine.integrations.gmail import build_raw_message
 
 _CFG = replace(
@@ -132,8 +133,13 @@ def test_friday_evening_next_open_is_monday_morning():
 # ---------------------------------------------------------------------------
 
 
-def _health(**kw: int):
-    base = {"sends": 0, "hard_bounces": 0, "spam_complaints": 0, "unsubscribes": 0}
+def _health(**kw: float):
+    base: dict[str, float] = {
+        "sends": 0,
+        "hard_bounces": 0,
+        "spam_complaints": 0,
+        "unsubscribes": 0,
+    }
     base.update(kw)
     return evaluate_health(health=_CFG.health, **base)
 
@@ -199,6 +205,7 @@ def _message() -> Message:
         send_state=SendState.SENDING,
         send_started_at=now,
         send_block_reason=None,
+        recipient_email_status=None,
         sent_at=None,
         created_at=now,
         updated_at=now,
@@ -224,3 +231,76 @@ def test_build_raw_message_is_plain_text_only():
     assert not parsed.is_multipart()
     assert parsed["To"] == "pat@acme.example"
     assert "<img" not in parsed.get_payload()
+
+
+# ---------------------------------------------------------------------------
+# M1.4a tiers: catch-all sub-cap arithmetic, role detection, weighted bounces
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("daily_cap", "share", "expected"),
+    [
+        (5, 0.4, 2),  # today's warmup week
+        (10, 0.4, 4),
+        (40, 0.4, 16),  # the share tracks the ramp; an absolute 2 would not
+        (5, 0.1, 1),  # floors to 0, raised to the minimum of 1
+        (1, 0.4, 1),
+        (0, 0.4, 0),  # a zero cap forbids everything, sub-cap included
+    ],
+)
+def test_catch_all_sub_cap_is_a_share_of_daily_cap(daily_cap: int, share: float, expected: int):
+    cfg = replace(_CFG, daily_cap=daily_cap, catch_all_share=share)
+    assert cfg.catch_all_daily_cap == expected
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("info@acme.example", True),
+        ("SALES@Acme.Example", True),
+        ("support@acme.example", True),
+        ("pat@acme.example", False),
+        ("info.patel@acme.example", False),  # a person, not the info@ mailbox
+    ],
+)
+def test_role_based_local_parts_are_detected_without_a_verifier(address: str, expected: bool):
+    assert is_role_based_address(address, _CFG) is expected
+
+
+def test_every_email_status_is_classified_in_exactly_one_tier():
+    tiers = _CFG.email_status_tiers
+    for status in EmailStatus:
+        assert tiers.tier_of(status) in {"send", "restricted", "never"}
+    assert not (tiers.send & tiers.restricted)
+    assert not (tiers.send & tiers.never)
+    assert not (tiers.restricted & tiers.never)
+
+
+def test_unverified_and_risky_are_never_send():
+    tiers = _CFG.email_status_tiers
+    for status in (
+        EmailStatus.UNVERIFIED,
+        EmailStatus.RISKY,
+        EmailStatus.ROLE_BASED,
+        EmailStatus.DISPOSABLE,
+        EmailStatus.INVALID,
+        EmailStatus.BOUNCED,
+        EmailStatus.SUPPRESSED,
+    ):
+        assert tiers.tier_of(status) == "never", status
+
+
+def test_catch_all_is_restricted_not_send():
+    assert _CFG.email_status_tiers.tier_of(EmailStatus.CATCH_ALL) == "restricted"
+
+
+def test_a_catch_all_bounce_counts_double_toward_the_pause_threshold():
+    """Below the sample floor 2 hard bounces pause. One catch-all bounce is
+    weighted 2, so it pauses on its own — accepted deliberately: a bounce in
+    the first fifty sends on a new domain is genuinely alarming."""
+    unweighted = _health(sends=10, hard_bounces=1)
+    weighted = _health(sends=10, hard_bounces=2.0)  # one catch-all bounce, weight 2
+
+    assert unweighted.pause_reasons == ()
+    assert weighted.pause_reasons

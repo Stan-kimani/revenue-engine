@@ -89,7 +89,7 @@ The human. One row per real person, permanently.
 |---|---|---|
 | id | uuid pk | |
 | email | citext unique | Natural key. |
-| email_status | enum | `unverified, valid, risky, invalid, bounced, suppressed` |
+| email_status | enum | `unverified, valid, risky, invalid, bounced, suppressed, catch_all, disposable, role_based` (M1.4a). **Write-once from verification**: `upsert_contact` preserves it, only `set_email_status()` changes it, and it never regresses to `unverified`. Tiered send/restricted/never by `config/base.yaml` — see deliverability.md §5. |
 | full_name / first_name / last_name | text | |
 | title | text | Raw job title as found. |
 | linkedin_url | text | |

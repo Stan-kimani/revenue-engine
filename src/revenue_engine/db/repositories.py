@@ -12,6 +12,7 @@ codec is registered on a bare connection), so every jsonb read goes through
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -223,7 +224,13 @@ async def upsert_contact(
                                    linkedin_url, company_id, attributes)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
             ON CONFLICT (email) DO UPDATE SET
-                email_status = EXCLUDED.email_status,
+                -- email_status is write-once from verification (M1.4a): a
+                -- verdict costs a credit, and every other caller passes the
+                -- UNVERIFIED default, so overwriting here would silently
+                -- clobber it on any re-import or re-enrichment. The column is
+                -- NOT NULL, so preserving it is a plain assignment (COALESCE
+                -- would be a no-op wrapper). Only set_email_status() changes it.
+                email_status = contacts.email_status,
                 full_name = COALESCE(EXCLUDED.full_name, contacts.full_name),
                 first_name = COALESCE(EXCLUDED.first_name, contacts.first_name),
                 last_name = COALESCE(EXCLUDED.last_name, contacts.last_name),
@@ -1144,6 +1151,40 @@ async def set_message_approval(
     )
 
 
+async def set_email_status(
+    conn: asyncpg.Connection,
+    *,
+    email: str,
+    status: EmailStatus,
+    attributes: dict[str, Any] | None = None,
+) -> Contact | None:
+    """The ONLY path that changes `contacts.email_status` (upsert_contact
+    preserves it). A status never regresses to 'unverified': a verdict, once
+    paid for, is permanent, and a later bounce/suppression must not be undone
+    by a re-import. Returns None if the address has no contact row.
+
+    `attributes` merges vendor metadata (score, free) as ordinary attribute
+    envelopes — neither is tiered on: score is a vendor-specific confidence
+    number, and a founder legitimately using a free mailbox is in the ICP.
+    """
+    if status == EmailStatus.UNVERIFIED:
+        raise ValueError("email_status may never be set back to 'unverified'")
+    if attributes:
+        _validate_attributes(attributes)
+    row = await conn.fetchrow(
+        """
+        UPDATE contacts
+        SET email_status = $2, attributes = attributes || $3::jsonb, updated_at = now()
+        WHERE email = $1 AND deleted_at IS NULL
+        RETURNING *
+        """,
+        email,
+        status.value,
+        _dump_json(attributes or {}),
+    )
+    return _row_to_contact(row) if row else None
+
+
 async def lock_sending_domain(conn: asyncpg.Connection, sending_domain: str) -> None:
     """Transaction-scoped advisory lock serialising gate evaluation +
     reservation per sending domain: without it, two workers could both read
@@ -1154,7 +1195,11 @@ async def lock_sending_domain(conn: asyncpg.Connection, sending_domain: str) -> 
 
 
 async def count_sends_since(
-    conn: asyncpg.Connection, *, sending_domain: str, since: datetime
+    conn: asyncpg.Connection,
+    *,
+    sending_domain: str,
+    since: datetime,
+    recipient_email_status: EmailStatus | None = None,
 ) -> int:
     """Every outbound message reserved or sent on the domain since `since` —
     first touches and follow-ups alike (deliverability.md §4: "The cap counts
@@ -1167,9 +1212,11 @@ async def count_sends_since(
           AND send_state IN ('sending', 'sent', 'send_unknown')
           AND lower(split_part(from_address::text, '@', 2)) = lower($1)
           AND send_started_at >= $2
+          AND ($3::text IS NULL OR recipient_email_status = $3)
         """,
         sending_domain,
         since,
+        recipient_email_status.value if recipient_email_status else None,
     )
     return int(count)
 
@@ -1231,6 +1278,38 @@ async def insert_suppression(
     )
     assert row is not None
     return _row_to_suppression(row)
+
+
+async def count_weighted_suppressions_since(
+    conn: asyncpg.Connection,
+    *,
+    reason: SuppressionReason,
+    since: datetime,
+    weight_by_status: Mapping[str, float],
+) -> float:
+    """Suppressions in the window, each weighted by the email status the
+    recipient HAD when we sent to them (messages.recipient_email_status, the
+    reservation-time snapshot) — a catch-all bounce counts double because
+    acceptance from a catch-all domain never proved the mailbox existed
+    (docs/deliverability.md §6). An address with no matching sent message, or
+    a status with no configured weight, counts 1.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT s.address,
+               (SELECT m.recipient_email_status
+                FROM messages m
+                WHERE m.to_address = s.address
+                  AND m.send_state IN ('sending', 'sent', 'send_unknown')
+                ORDER BY m.send_started_at DESC
+                LIMIT 1) AS status_at_send
+        FROM suppressions s
+        WHERE s.reason = $1 AND s.address IS NOT NULL AND s.created_at >= $2
+        """,
+        reason.value,
+        since,
+    )
+    return sum(float(weight_by_status.get(row["status_at_send"] or "", 1.0)) for row in rows)
 
 
 async def count_suppressions_since(
@@ -1301,18 +1380,25 @@ async def resume_sending_pause(
 
 
 async def reserve_message_for_send(
-    conn: asyncpg.Connection, message_id: UUID, *, now: datetime
+    conn: asyncpg.Connection,
+    message_id: UUID,
+    *,
+    now: datetime,
+    recipient_email_status: EmailStatus,
 ) -> Message | None:
     """drafted -> sending. None if the row is no longer 'drafted' — the
     single transition that makes a second send of one message impossible."""
     row = await conn.fetchrow(
         """
-        UPDATE messages SET send_state = 'sending', send_started_at = $2, updated_at = now()
+        UPDATE messages
+        SET send_state = 'sending', send_started_at = $2, recipient_email_status = $3,
+            updated_at = now()
         WHERE id = $1 AND send_state = 'drafted'
         RETURNING *
         """,
         message_id,
         now,
+        recipient_email_status.value,
     )
     return _row_to_message(row) if row else None
 
@@ -1574,6 +1660,9 @@ def _row_to_message(row: asyncpg.Record) -> Message:
         send_state=SendState(row["send_state"]) if row["send_state"] else None,
         send_started_at=row["send_started_at"],
         send_block_reason=row["send_block_reason"],
+        recipient_email_status=(
+            EmailStatus(row["recipient_email_status"]) if row["recipient_email_status"] else None
+        ),
         sent_at=row["sent_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
